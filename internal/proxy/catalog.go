@@ -177,13 +177,13 @@ func (p *Proxy) StartModelRefresher() {
 		for {
 			ids, err := fetchModelIDs()
 			if err != nil {
-				log.Printf("model catalog refresh failed: %v", err)
+				log.Printf("模型目录刷新失败: %v", err)
 				time.Sleep(modelCatalogRetryAfter)
 				continue
 			}
 			catalog.update(ids)
 			if p.Debug {
-				log.Printf("model catalog updated: %d models", len(ids))
+				log.Printf("模型目录已更新: 共 %d 个模型", len(ids))
 			}
 			time.Sleep(modelCatalogRefreshEvery)
 		}

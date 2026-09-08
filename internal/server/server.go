@@ -69,7 +69,7 @@ func logger(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		log.Printf("[%s] %s %s", r.Method, r.URL.Path, r.RemoteAddr)
 		next(w, r)
-		log.Printf("[%s] %s done in %v", r.Method, r.URL.Path, time.Since(start))
+		log.Printf("[%s] %s 完成, 耗时 %v", r.Method, r.URL.Path, time.Since(start))
 	}
 }
 
@@ -77,6 +77,6 @@ func logger(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) Start() {
 	addr := s.Host + ":" + s.Port
 	if err := http.ListenAndServe(addr, s.Handler); err != nil {
-		log.Fatalf("Server failed: %v", err)
+		log.Fatalf("服务器启动失败: %v", err)
 	}
 }

@@ -25,7 +25,7 @@ func truncateLog(s string) string {
 	if len(s) <= debugLogLimit {
 		return s
 	}
-	return s[:debugLogLimit] + fmt.Sprintf("... [truncated %d bytes]", len(s)-debugLogLimit)
+	return s[:debugLogLimit] + fmt.Sprintf("... [已截断 %d 字节]", len(s)-debugLogLimit)
 }
 
 func (p *Proxy) debugf(format string, args ...any) {
@@ -134,7 +134,7 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
-	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
+	p.debugf("[调试] CommandCode 请求体: %s", truncateLog(string(reqJSON)))
 
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.BaseURL+"/alpha/generate", bytes.NewReader(reqJSON))
@@ -186,7 +186,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.debugf("[DEBUG] Client request body: %s", truncateLog(string(body)))
+	p.debugf("[调试] 客户端请求体: %s", truncateLog(string(body)))
 
 	var openAIReq api.OpenAIChatRequest
 	if err := json.Unmarshal(body, &openAIReq); err != nil {
@@ -224,7 +224,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if ccResp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(ccResp.Body)
 		message := fmt.Sprintf("Upstream error: %s", string(errBody))
-		log.Printf("[ERROR] Upstream returned %d: %s", ccResp.StatusCode, string(errBody))
+		log.Printf("[错误] 上游返回 %d: %s", ccResp.StatusCode, string(errBody))
 		status := http.StatusBadGateway
 		if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
 			status = ccResp.StatusCode
@@ -273,7 +273,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		if line == "" {
 			continue
 		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
+		p.debugf("[调试] CommandCode 流式数据行: %s", truncateLog(line))
 
 		var event api.CCStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
@@ -423,12 +423,12 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			flusher.Flush()
 
 		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
+			log.Printf("[错误] 流式响应出错: %v", event.Error)
 		}
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		log.Printf("[ERROR] Scanner error: %v", err)
+		log.Printf("[错误] 流读取失败: %v", err)
 	}
 }
 
@@ -456,7 +456,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		if line == "" {
 			continue
 		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
+		p.debugf("[调试] CommandCode 流式数据行: %s", truncateLog(line))
 
 		var event api.CCStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
@@ -530,7 +530,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 				outputTokens = event.TotalUsage.OutputTokens
 			}
 		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
+			log.Printf("[错误] 流式响应出错: %v", event.Error)
 		}
 	}
 
@@ -578,7 +578,7 @@ func (p *Proxy) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.debugf("[DEBUG] Client responses request body: %s", truncateLog(string(body)))
+	p.debugf("[调试] 客户端 Responses 请求体: %s", truncateLog(string(body)))
 
 	var responsesReq api.OpenAIResponsesRequest
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
