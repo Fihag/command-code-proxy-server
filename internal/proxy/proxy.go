@@ -65,6 +65,7 @@ type Proxy struct {
 	Client   *http.Client
 	Debug    bool
 	identity *identity
+	envCfg   *envConfigCache
 }
 
 // NewProxy creates a new proxy instance
@@ -74,6 +75,7 @@ func NewProxy(apiKey string) *Proxy {
 		BaseURL:  defaultBaseURL,
 		Client:   &http.Client{Timeout: defaultTimeout},
 		identity: newIdentity(""),
+		envCfg:   newEnvConfigCache(),
 	}
 	p.StartModelRefresher()
 	return p
@@ -91,10 +93,10 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	system, msgs := ExtractSystem(openAIReq.Messages)
 	ccMessages := ConvertMessages(msgs)
 
-	temperature := 0.3
+	temperature := (*float64)(nil)
 	maxTokens := 64000
 	if openAIReq.Temperature != nil {
-		temperature = *openAIReq.Temperature
+		temperature = openAIReq.Temperature
 	}
 	if openAIReq.MaxTokens != nil {
 		maxTokens = *openAIReq.MaxTokens
@@ -106,30 +108,24 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	tools := ConvertTools(openAIReq.Tools)
 
 	ccBody := api.CCRequestBody{
-		Config: api.CCConfig{
-			WorkingDir:    ".",
-			Date:          time.Now().Format("2006-01-02"),
-			Environment:   "cli",
-			Structure:     []string{},
-			IsGitRepo:     false,
-			CurrentBranch: "",
-			MainBranch:    "main",
-			GitStatus:     "",
-			RecentCommits: []string{},
-		},
-		Memory: "",
-		Taste:  "",
-		Skills: "",
+		Config: p.envCfg.get(),
+		// memory/taste/skills: JSON null, as the CLI's postStream sends them
+		// when taste learning and project context are unused.
+		Memory:         nil,
+		Taste:          nil,
+		Skills:         nil,
+		PermissionMode: "standard",
+		Mode:           "default",
 		Params: api.CCChatParams{
 			Model:       model,
 			Messages:    ccMessages,
 			Tools:       tools,
 			System:      system,
 			MaxTokens:   maxTokens,
-			Temperature: temperature,
 			Stream:      true,
+			Temperature: temperature,
 		},
-		ThreadID: p.identity.sessionFor(openAIReq),
+		Session: p.identity.sessionFor(openAIReq),
 	}
 
 	return ccBody, nil
@@ -159,7 +155,7 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	// without them the upstream sees Go's default User-Agent and no session
 	// correlation at all (see internal/proxy/identity.go).
 	ccReq.Header.Set("User-Agent", "cli")
-	ccReq.Header.Set("x-session-id", ccBody.ThreadID)
+	ccReq.Header.Set("x-session-id", ccBody.Session)
 	ccReq.Header.Set("x-project-slug", p.identity.slug)
 	ccReq.Header.Set("x-taste-learning", "false")
 

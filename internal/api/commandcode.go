@@ -26,13 +26,15 @@ type CCMessage struct {
 }
 
 type CCChatParams struct {
+	// Order mirrors the CLI wire params: stream precedes temperature, and
+	// temperature is only present when the caller set it.
 	Model       string      `json:"model"`
 	Messages    []CCMessage `json:"messages"`
 	Tools       []any       `json:"tools"`
 	System      string      `json:"system"`
 	MaxTokens   int         `json:"max_tokens"`
-	Temperature float64     `json:"temperature"`
 	Stream      bool        `json:"stream"`
+	Temperature *float64    `json:"temperature,omitempty"`
 }
 
 type CCConfig struct {
@@ -48,12 +50,25 @@ type CCConfig struct {
 }
 
 type CCRequestBody struct {
-	Config   CCConfig     `json:"config"`
-	Memory   string       `json:"memory"`
-	Taste    string       `json:"taste"`
-	Skills   string       `json:"skills"`
-	Params   CCChatParams `json:"params"`
-	ThreadID string       `json:"threadId"`
+	// Field order and nullability mirror the official CLI's /alpha/generate
+	// wire body exactly (see buildCommandAuthHeaders/postStream in
+	// command-code dist/cli.mjs): memory/taste/skills are JSON null when
+	// unused, threadId is omitted (toWireThreadId drops non-uuid ids, and
+	// the CLI session id "sess_..." never qualifies), and promptCache is
+	// absent on chat calls.
+	Config         CCConfig     `json:"config"`
+	Memory         *string      `json:"memory"`
+	Taste          *string      `json:"taste"`
+	Skills         *string      `json:"skills"`
+	PermissionMode string       `json:"permissionMode"`
+	ThreadID       string       `json:"threadId,omitempty"`
+	Mode           string       `json:"mode"`
+	Params         CCChatParams `json:"params"`
+
+	// Session carries the CLI-style "sess_..." id for the x-session-id
+	// header. It is deliberately not serialized: the real CLI sends
+	// threadId only when it is a uuid, and its session id never is.
+	Session string `json:"-"`
 }
 
 type CCStreamEvent struct {
