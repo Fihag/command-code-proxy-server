@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -238,7 +239,7 @@ func parseClientHello(t *testing.T, rec []byte) helloFields {
 func TestRoundTripMatchesNodeBaseline(t *testing.T) {
 	// Baseline: the exact bytes a real Node v22 fetch sent to the tap,
 	// captured earlier and stored next to this test.
-	baseline, err := os.ReadFile("node22_clienthello.bin")
+	baseline, err := os.ReadFile("node24_clienthello.bin")
 	if err != nil {
 		t.Fatalf("read baseline: %v", err)
 	}
@@ -264,8 +265,8 @@ func TestRoundTripMatchesNodeBaseline(t *testing.T) {
 	req.Header.Set("x-command-code-version", "1.50.1")
 	req.Header.Set("x-cli-environment", "production")
 	req.Header.Set("x-project-slug", "demo-proj")
-	req.Header.Set("x-taste-learning", "false")
-	req.Header.Set("x-session-id", "sess_deadbeefcafe1234")
+	req.Header.Set("x-taste-learning", "true")
+	req.Header.Set("x-session-id", "5178a72b-04a7-497d-8639-8c87974f3288")
 	req.Header.Set("Authorization", "Bearer sk-test")
 	resp, err := cl.Do(req)
 	if err != nil {
@@ -323,14 +324,15 @@ func TestRoundTripMatchesNodeBaseline(t *testing.T) {
 		"POST /alpha/generate HTTP/1.1",
 		"host: " + host,
 		"connection: keep-alive",
-		"Content-Type: application/json",
+		"content-type: application/json, application/json",
 		"User-Agent: cli",
 		"x-command-code-version: 1.50.1",
 		"x-cli-environment: production",
 		"x-project-slug: demo-proj",
-		"x-taste-learning: false",
-		"x-session-id: sess_deadbeefcafe1234",
+		"x-taste-learning: true",
+		"x-session-id: 5178a72b-04a7-497d-8639-8c87974f3288",
 		"Authorization: Bearer sk-test",
+		"TRACEPARENT",
 		"accept: */*",
 		"accept-language: *",
 		"sec-fetch-mode: cors",
@@ -342,9 +344,85 @@ func TestRoundTripMatchesNodeBaseline(t *testing.T) {
 		t.Fatalf("header line count %d want %d:\n%q", len(gotLines), len(wantLines), gotReq)
 	}
 	for i := range wantLines {
+		if wantLines[i] == "TRACEPARENT" {
+			// W3C trace context is random per call; assert shape only.
+			if !traceparentRE.MatchString(gotLines[i]) {
+				t.Errorf("line %d: %q is not a traceparent", i, gotLines[i])
+			}
+			continue
+		}
 		if gotLines[i] != wantLines[i] {
 			t.Errorf("line %d:\n got %q\nwant %q", i, gotLines[i], wantLines[i])
 		}
+	}
+}
+
+var traceparentRE = regexp.MustCompile(`^traceparent: 00-[0-9a-f]{32}-[0-9a-f]{16}-01$`)
+
+func TestLifecycleFingerprintWhoamiTemplates(t *testing.T) {
+	tp := startTap(t, "", `{"ok":true}`)
+	cl := &http.Client{
+		Transport: &Transport{InsecureSkipVerify: true},
+		Timeout:   10 * time.Second,
+	}
+	type headCase struct {
+		path string
+		head []string
+	}
+	cases := []headCase{
+		{
+			path: "/alpha/lifecycle-events",
+			head: []string{"content-type: application/json, application/json", "x-cli-environment: production", "Authorization: Bearer sk-test", "User-Agent: cli", "x-command-code-version: 1.50.1"},
+		},
+		{
+			path: "/alpha/fingerprint/record",
+			head: []string{"content-type: application/json", "Authorization: Bearer sk-test", "x-cli-environment: production", "x-command-code-version: 1.50.1", "User-Agent: cli"},
+		},
+	}
+	for _, c := range cases {
+		req, _ := http.NewRequest("POST", "https://"+tp.addr+c.path, strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "cli")
+		req.Header.Set("Authorization", "Bearer sk-test")
+		req.Header.Set("x-cli-environment", "production")
+		req.Header.Set("x-command-code-version", "1.50.1")
+		resp, err := cl.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", c.path, err)
+		}
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		got := <-tp.requestCh
+		lines := strings.Split(got, "\r\n")
+		// skip request line, host, connection
+		if len(lines) < 3+len(c.head) {
+			t.Fatalf("%s: too few lines: %q", c.path, got)
+		}
+		for i, w := range c.head {
+			if lines[3+i] != w {
+				t.Errorf("%s line %d:\n got %q\nwant %q", c.path, 3+i, lines[3+i], w)
+			}
+		}
+		if strings.Contains(got, "traceparent:") {
+			t.Errorf("%s must not carry traceparent: %q", c.path, got)
+		}
+	}
+
+	// whoami: GET, no content-length at all.
+	req, _ := http.NewRequest("GET", "https://"+tp.addr+"/alpha/whoami", nil)
+	req.Header.Set("Authorization", "Bearer sk-test")
+	resp, err := cl.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := <-tp.requestCh
+	if strings.Contains(got, "content-length:") {
+		t.Errorf("GET whoami must not send content-length: %q", got)
+	}
+	if lines := strings.Split(got, "\r\n"); !strings.HasPrefix(lines[0], "GET /alpha/whoami") {
+		t.Errorf("whoami request line: %q", lines[0])
 	}
 }
 

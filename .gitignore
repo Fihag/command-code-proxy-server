@@ -16,3 +16,6 @@
 .DS_Store
 Thumbs.db
 bin/*.~
+
+# 本机设备指纹（含哈希，绝不入库）
+fingerprint.json

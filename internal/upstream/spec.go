@@ -16,7 +16,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-//go:embed node22_clienthello.bin
+//go:embed node24_clienthello.bin
 var baselineClientHello []byte
 
 // Spec returns a fresh utls ClientHelloSpec cloned from the embedded Node

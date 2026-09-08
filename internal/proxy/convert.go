@@ -77,21 +77,25 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 	return ccMsgs
 }
 
-func ConvertTools(openAITools []any) []any {
-	if len(openAITools) == 0 {
-		return []any{}
-	}
-
-	tools := make([]any, 0, len(openAITools))
+// ConvertTools maps OpenAI function tools onto the CLI's wire tool objects
+// ({name, description, input_schema}, in that order). Schemas are re-encoded
+// compactly; their internal key order follows whatever the caller supplied.
+func ConvertTools(openAITools []any) []api.CCTool {
+	tools := make([]api.CCTool, 0, len(openAITools))
 	for _, tool := range openAITools {
 		toolMap, ok := tool.(map[string]any)
 		if !ok {
 			continue
 		}
 
-		toolType, _ := toolMap["type"].(string)
-		if toolType != "function" {
-			tools = append(tools, toolMap)
+		// Already CLI-shaped (non-function passthrough).
+		if toolType, _ := toolMap["type"].(string); toolType != "function" && toolType != "" {
+			name, _ := toolMap["name"].(string)
+			desc, _ := toolMap["description"].(string)
+			schema := mustMarshal(toolMap["input_schema"])
+			if name != "" {
+				tools = append(tools, api.CCTool{Name: name, Description: desc, InputSchema: schema})
+			}
 			continue
 		}
 
@@ -99,25 +103,26 @@ func ConvertTools(openAITools []any) []any {
 		if !ok {
 			continue
 		}
-
 		name, _ := fn["name"].(string)
 		if name == "" {
 			continue
 		}
-
-		inputSchema, ok := fn["parameters"].(map[string]any)
-		if !ok || inputSchema == nil {
-			inputSchema = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
-
-		ccTool := map[string]any{"name": name, "input_schema": inputSchema}
-		if description, ok := fn["description"].(string); ok && description != "" {
-			ccTool["description"] = description
-		}
-		tools = append(tools, ccTool)
+		desc, _ := fn["description"].(string)
+		schema := mustMarshal(fn["parameters"])
+		tools = append(tools, api.CCTool{Name: name, Description: desc, InputSchema: schema})
 	}
-
 	return tools
+}
+
+func mustMarshal(v any) json.RawMessage {
+	if v == nil {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	return b
 }
 
 func parseToolInput(arguments string) any {

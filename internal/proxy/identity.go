@@ -5,18 +5,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
+	"github.com/google/uuid"
 )
 
-// The upstream API associates every /alpha/generate call with a CLI session:
-// x-session-id, the User-Agent literal, x-project-slug and a stable
-// threadId (which equals the session id for the whole lifetime of a CLI
-// process). This file replicates that identity layer so forwarded traffic
-// carries the same correlation fields a real CLI run would.
+// The upstream API correlates /alpha/generate traffic with three identity
+// fields (authoritative capture via tools/tap against command-code 1.50.1):
+// the x-session-id header and the body threadId carry the SAME per-conversation
+// uuid v4, while lifecycle-events carry a separate process-level "sess_..." id
+// minted at CLI start. x-project-slug is the slugified working directory.
+// This file replicates that identity layer so forwarded traffic carries the
+// same correlation fields a real CLI run would.
 
 // sessionTTL bounds how long one client conversation keeps its session id.
 // The CLI mints a fresh session per process start; long-lived proxy
@@ -24,14 +27,36 @@ import (
 // restarting their terminal.
 const sessionTTL = 2 * time.Hour
 
-// newSessID mirrors the CLI's generateSessionId(): "sess_" + 16 hex chars
-// (the CLI uses the uuid v4 string with dashes removed, first 16 chars).
+// newSessID mirrors the CLI's process-level session id used in
+// lifecycle-events: "sess_" + 16 hex chars.
 func newSessID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "sess_0000000000000000"
 	}
 	return "sess_" + hex.EncodeToString(b[:])
+}
+
+// newThreadID mirrors the CLI's per-conversation thread id: a uuid v4 that
+// appears both as the body threadId and the x-session-id header.
+func newThreadID() string { return uuid.New().String() }
+
+// slugPath converts a working directory to the CLI's x-project-slug form:
+// lowercased, every run of non-alphanumeric characters becomes a single
+// dash ("D:gent\cc\web" -> "d-agent-cc-web").
+func slugPath(dir string) string {
+	var b strings.Builder
+	prevDash := true
+	for _, r := range strings.ToLower(dir) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.TrimSuffix(b.String(), "-")
 }
 
 // identity carries the per-process CLI look-alike attributes.
@@ -50,10 +75,11 @@ type identityEntry struct {
 
 func newIdentity(slug string) *identity {
 	if slug == "" {
+		slug = "cli"
 		if wd, err := os.Getwd(); err == nil {
-			slug = filepath.Base(wd)
-		} else {
-			slug = "cli"
+			if s := slugPath(wd); s != "" {
+				slug = s
+			}
 		}
 	}
 	return &identity{
@@ -79,7 +105,9 @@ func (idn *identity) sessionFor(openAIReq api.OpenAIChatRequest) string {
 			}
 		}
 		if firstUser == "" && system == "" {
-			return idn.processSess
+			// No conversation context at all: like a fresh CLI thread per
+			// call — a brand-new uuid, nothing reused to correlate against.
+			return newThreadID()
 		}
 		sum := sha256.Sum256([]byte(openAIReq.Model + "\x00" + system + "\x00" + firstUser))
 		convKey = hex.EncodeToString(sum[:16])
@@ -98,7 +126,7 @@ func (idn *identity) sessionFor(openAIReq api.OpenAIChatRequest) string {
 			delete(idn.sessions, k)
 		}
 	}
-	id := newSessID()
+	id := newThreadID()
 	idn.sessions[convKey] = identityEntry{id: id, seen: now}
 	return id
 }

@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
@@ -22,11 +24,59 @@ const defaultBaseURL = "https://api.commandcode.ai"
 const defaultTimeout = 300 * time.Second
 const debugLogLimit = 20000
 
+// fingerprintFile is the local (gitignored) device fingerprint reported to
+// /alpha/fingerprint/record at startup — the real CLI uploads it per process.
+// Produced by tools/recapture.mjs from a tap capture; absence disables only
+// the fingerprint beacon, never the proxy itself.
+const fingerprintFile = "fingerprint.json"
+
+// defaultTools holds command-code 1.50.1's built-in tool definitions,
+// captured byte-exactly from the real CLI via tools/tap (clitools.json).
+// The CLI never sends an empty tools array, so a client that passes no tools
+// gets these instead of a behavioral tell.
+//
+//go:embed clitools.json
+var cliToolsRaw []byte
+
+var defaultTools []api.CCTool
+
+func init() {
+	if err := json.Unmarshal(cliToolsRaw, &defaultTools); err != nil {
+		panic("clitools.json: " + err.Error())
+	}
+}
+
 func truncateLog(s string) string {
 	if len(s) <= debugLogLimit {
 		return s
 	}
 	return s[:debugLogLimit] + fmt.Sprintf("... [已截断 %d 字节]", len(s)-debugLogLimit)
+}
+
+// redactSecrets masks bearer-token-shaped strings before any value is echoed
+// back to a client or written to a log line. Upstream 4xx bodies are passed
+// through verbatim, and some gateways reflect request context (including the
+// Authorization header) in their error message.
+func redactSecrets(s string) string {
+	i := 0
+	var b strings.Builder
+	for {
+		j := strings.Index(s[i:], "Bearer ")
+		if j < 0 {
+			b.WriteString(s[i:])
+			break
+		}
+		j += i
+		b.WriteString(s[i:j])
+		k := j + len("Bearer ")
+		end := k
+		for end < len(s) && s[end] != ' ' && s[end] != '"' && s[end] != '\n' && s[end] != '\r' && s[end] != ',' && s[end] != '}' && end-k < 200 {
+			end++
+		}
+		b.WriteString("Bearer [已脱敏]")
+		i = end
+	}
+	return b.String()
 }
 
 func (p *Proxy) debugf(format string, args ...any) {
@@ -61,12 +111,19 @@ func normalizeFinishReason(reason string) string {
 
 // Proxy struct
 type Proxy struct {
-	APIKey   string
-	BaseURL  string
-	Client   *http.Client
-	Debug    bool
-	identity *identity
-	envCfg   *envConfigCache
+	APIKey     string
+	BaseURL    string
+	Client     *http.Client
+	Debug      bool
+	identity   *identity
+	envCfg     *envConfigCache
+	beaconOnce sync.Once
+}
+
+func (p *Proxy) beaconCtx() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	go func() { defer cancel(); <-ctx.Done() }()
+	return ctx
 }
 
 // NewProxy creates a new proxy instance
@@ -106,7 +163,20 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		maxTokens = *openAIReq.MaxCompletionTokens
 	}
 
+	// The CLI always ships its built-in tool set in every generate call.
+	// Mirror that: use the client's tools when it passed some, otherwise
+	// send the captured real-CLI definitions (clitools.json).
 	tools := ConvertTools(openAIReq.Tools)
+	if len(tools) == 0 {
+		tools = defaultTools
+	}
+
+	var systemBlocks []api.CCSystemBlock
+	if system != "" {
+		systemBlocks = []api.CCSystemBlock{{Type: "text", Text: system}}
+	} else {
+		systemBlocks = []api.CCSystemBlock{}
+	}
 
 	ccBody := api.CCRequestBody{
 		Config: p.envCfg.get(),
@@ -116,17 +186,16 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		Taste:          nil,
 		Skills:         nil,
 		PermissionMode: "standard",
-		Mode:           "default",
+		ThreadID:       p.identity.sessionFor(openAIReq),
 		Params: api.CCChatParams{
 			Model:       model,
 			Messages:    ccMessages,
 			Tools:       tools,
-			System:      system,
+			System:      systemBlocks,
 			MaxTokens:   maxTokens,
 			Stream:      true,
 			Temperature: temperature,
 		},
-		Session: p.identity.sessionFor(openAIReq),
 	}
 
 	return ccBody, nil
@@ -157,9 +226,9 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	// without them the upstream sees Go's default User-Agent and no session
 	// correlation at all (see internal/proxy/identity.go).
 	ccReq.Header.Set("User-Agent", "cli")
-	ccReq.Header.Set("x-session-id", ccBody.Session)
+	ccReq.Header.Set("x-session-id", ccBody.ThreadID)
 	ccReq.Header.Set("x-project-slug", p.identity.slug)
-	ccReq.Header.Set("x-taste-learning", "false")
+	ccReq.Header.Set("x-taste-learning", "true")
 
 	return ccReq, nil
 }
@@ -234,10 +303,12 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ccResp.Body.Close()
 
+	p.StartBeacon(apiKey)
+
 	if ccResp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(ccResp.Body)
-		message := fmt.Sprintf("Upstream error: %s", string(errBody))
-		log.Printf("[错误] 上游返回 %d: %s", ccResp.StatusCode, string(errBody))
+		message := fmt.Sprintf("Upstream error: %s", redactSecrets(string(errBody)))
+		log.Printf("[错误] 上游返回 %d: %s", ccResp.StatusCode, redactSecrets(string(errBody)))
 		status := http.StatusBadGateway
 		if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
 			status = ccResp.StatusCode

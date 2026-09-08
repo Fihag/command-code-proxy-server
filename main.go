@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/proxy"
 	"github.com/dev2k6/command-code-proxy-server/internal/server"
@@ -16,17 +17,24 @@ const debugLogging = false
 func main() {
 	port := flag.String("port", "", "监听端口 (默认: 55990)")
 	host := flag.String("host", "", "绑定地址 (默认: 127.0.0.1)")
-	apiKey := flag.String("api-key", "", "CommandCode API 密钥 (可选, 也可通过 Authorization 请求头传入)")
+	apiKeyFlag := flag.String("api-key", "", "CommandCode API 密钥 (可选, 也可通过 Authorization 请求头传入)")
 	projectSlug := flag.String("project-slug", "", "上报给上游的项目名 x-project-slug (默认: 当前目录名)")
 	showVersion := flag.Bool("version", false, "打印版本号后退出")
 	flag.Parse()
+
+	// 命令行明文密钥会出现在进程列表/命令历史里；环境变量优先兜底。
+	key := *apiKeyFlag
+	if key == "" {
+		key = os.Getenv("COMMANDCODE_API_KEY")
+	}
 
 	if *showVersion {
 		fmt.Println(versionText())
 		return
 	}
 
-	proxy := proxy.NewProxy(*apiKey)
+	proxy := proxy.NewProxy(*apiKeyFlag)
+	proxy.StartBeacon(key) // 启动时按真 CLI 的上报序列注册会话与设备指纹
 	proxy.Debug = debugLogging
 	if *projectSlug != "" {
 		proxy.SetProjectSlug(*projectSlug)

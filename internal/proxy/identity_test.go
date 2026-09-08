@@ -25,8 +25,8 @@ func TestBuildRequestCarriesCLIHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildRequest: %v", err)
 	}
-	if !strings.HasPrefix(ccBody.Session, "sess_") || len(ccBody.Session) != 5+16 {
-		t.Fatalf("session = %q, want sess_ + 16 hex chars", ccBody.Session)
+	if !isUUID(ccBody.ThreadID) {
+		t.Fatalf("threadId = %q, want uuid v4", ccBody.ThreadID)
 	}
 
 	httpReq, err := p.CreateUpstreamRequest(context.Background(), ccBody, "k")
@@ -35,9 +35,9 @@ func TestBuildRequestCarriesCLIHeaders(t *testing.T) {
 	}
 	for h, want := range map[string]string{
 		"User-Agent":        "cli",
-		"x-session-id":      ccBody.Session,
+		"x-session-id":      ccBody.ThreadID,
 		"x-project-slug":    "demo-proj",
-		"x-taste-learning":  "false",
+		"x-taste-learning":  "true",
 		"x-cli-environment": "production",
 	} {
 		if got := httpReq.Header.Get(h); got != want {
@@ -46,14 +46,39 @@ func TestBuildRequestCarriesCLIHeaders(t *testing.T) {
 	}
 }
 
-// TestWireBodyShape asserts the serialized body matches the CLI's
-// postStream payload: null memory/taste/skills, permissionMode/mode
-// present, no threadId, and temperature absent when unset.
+// isUUID checks the 8-4-4-4-12 lowercase-hex shape the CLI uses for thread
+// ids / x-session-id.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TestWireBodyShape asserts the serialized body matches the real CLI's
+// /alpha/generate payload (authoritative tap capture of 1.50.1): null
+// memory/taste/skills, permissionMode + uuid threadId present, no mode key,
+// system as a block array, tools non-empty, temperature absent when unset.
 func TestWireBodyShape(t *testing.T) {
 	p := NewProxy("k")
 	ccBody, err := p.BuildRequest(api.OpenAIChatRequest{
-		Model:    "deepseek-v4-pro",
-		Messages: []api.OpenAIMessage{{Role: "user", Content: "hi"}},
+		Model: "deepseek-v4-pro",
+		Messages: []api.OpenAIMessage{
+			{Role: "system", Content: "be nice"},
+			{Role: "user", Content: "hi"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -65,14 +90,14 @@ func TestWireBodyShape(t *testing.T) {
 	s := string(raw)
 	for _, want := range []string{
 		`"memory":null`, `"taste":null`, `"skills":null`,
-		`"permissionMode":"standard"`, `"mode":"default"`,
-		`"stream":true`,
+		`"permissionMode":"standard"`,
+		`"stream":true`, `"system":[{"type":"text","text":"be nice"}]`, `"name":"read_file"`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("body missing %s: %s", want, s)
 		}
 	}
-	for _, absent := range []string{`"threadId"`, `"temperature"`, `"promptCache"`} {
+	for _, absent := range []string{`"mode"`, `"temperature"`, `"promptCache"`} {
 		if strings.Contains(s, absent) {
 			t.Errorf("body must not contain %s: %s", absent, s)
 		}
@@ -81,8 +106,11 @@ func TestWireBodyShape(t *testing.T) {
 	if idx := strings.Index(s, `"config"`); idx != 1 {
 		t.Errorf(`"config" not first: idx=%d body=%s`, idx, s)
 	}
-	if idx := strings.Index(s, `"params"`); !strings.HasSuffix(s[:idx], `"mode":"default",`) {
-		t.Errorf(`"params" not after mode: %s`, s)
+	if idx := strings.Index(s, `"params"`); !strings.Contains(s[:idx], `"threadId":"`) {
+		t.Errorf(`"params" not after threadId: %s`, s)
+	}
+	if idx := strings.Index(s, `"threadId":"`); !strings.HasPrefix(s[idx:], `"threadId":"`+ccBody.ThreadID+`","params"`) {
+		t.Errorf(`threadId must equal x-session-id uuid and precede params: %s`, s[idx:idx+80])
 	}
 }
 
@@ -144,11 +172,14 @@ func TestSessionStickyPerConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Session != again.Session {
-		t.Errorf("same user should reuse session: %q vs %q", first.Session, again.Session)
+	if first.ThreadID != again.ThreadID {
+		t.Errorf("same user should reuse thread: %q vs %q", first.ThreadID, again.ThreadID)
 	}
-	if first.Session == other.Session {
-		t.Error("different users must not share a session")
+	if !isUUID(first.ThreadID) {
+		t.Errorf("threadId not uuid: %q", first.ThreadID)
+	}
+	if first.ThreadID == other.ThreadID {
+		t.Error("different users must not share a thread")
 	}
 }
 
@@ -173,7 +204,7 @@ func TestSessionStableWithoutUserField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Session != b.Session {
-		t.Errorf("multi-turn replay must keep session: %q vs %q", a.Session, b.Session)
+	if a.ThreadID != b.ThreadID {
+		t.Errorf("multi-turn replay must keep thread: %q vs %q", a.ThreadID, b.ThreadID)
 	}
 }

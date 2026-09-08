@@ -86,8 +86,11 @@ GOOS=linux GOARCH=amd64 go build -o bin/command-code-proxy
 The proxy uses the API key in this order:
 
 1. `Authorization` header from the incoming client request
-2. `-api-key` CLI value
+2. `-api-key` CLI value, or the `COMMANDCODE_API_KEY` environment variable
 3. If neither exists, the request returns `401 Unauthorized`
+
+> 命令行参数会出现在进程列表与 shell 历史里；常驻服务建议改用环境变量：
+> `setx COMMANDCODE_API_KEY "..."`（新终端生效）。
 
 Header format:
 
@@ -255,3 +258,20 @@ https://registry.npmjs.org/command-code/latest
 ```
 
 The fetched version is cached for 30 minutes. If the registry request fails, the proxy uses the last cached version, or `unknown` if no version has been fetched yet.
+
+## 重捕获指纹基准（模板老化维护）
+
+本代理的 TLS 握手指纹（`internal/upstream/node24_clienthello.bin`）、CLI 内置工具定义（`internal/proxy/clitools.json`）与设备指纹上报体（`fingerprint.json`，不入库）都来自真实 CLI 的一次捕获。CLI 会自动更新，捆绑的 Node/OpenSSL 版本变化后基准会老化，此时按下列步骤重捕：
+
+1. 解析真实上游 IP（供探针转发用，避免 hosts 回环）：
+   `nslookup api.commandcode.ai` → 记下任一 IPv4（如 `172.67.167.23`）。
+2. 以管理员在 `C:\Windows\System32\drivers\etc\hosts` 末尾添加：
+   `127.0.0.1 api.commandcode.ai`
+3. 启动转发探针（会透明转发到真实上游，会话正常进行）：
+   `go run ./tools/tap -listen 127.0.0.1:443 -upstream <IP>:443 -out capture.jsonl`
+4. 跑一次真 CLI 直到发出 generate 请求（会产生一次真实对话，消耗少量额度）：
+   `set NODE_TLS_REJECT_UNAUTHORIZED=0 && command-code -p "Reply with exactly: OK" --no-session --skip-onboarding -m deepseek/deepseek-v4-flash`
+5. **立刻删除 hosts 里的重定向行并停掉探针。**
+6. 一键回灌三份基准数据：
+   `node tools/recapture.mjs capture.jsonl`
+7. 重跑 `go test ./...`（测试会将传输层握手与该基准逐字段比对），然后重新构建二进制。

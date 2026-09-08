@@ -1,5 +1,7 @@
 package api
 
+import "encoding/json"
+
 // CommandCode API types (internal)
 
 type CCToolOutput struct {
@@ -25,16 +27,32 @@ type CCMessage struct {
 	Content []CCContentPart `json:"content"`
 }
 
+// CCTool mirrors the CLI's toWireTools output: exactly name, description,
+// input_schema in that order. InputSchema is kept as raw bytes so the JSON
+// Schema's own key order survives the round trip untouched.
+type CCTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// CCSystemBlock is one system prompt content block ({type:"text",text:...});
+// the CLI always sends system as an array of such blocks.
+type CCSystemBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
 type CCChatParams struct {
 	// Order mirrors the CLI wire params: stream precedes temperature, and
 	// temperature is only present when the caller set it.
-	Model       string      `json:"model"`
-	Messages    []CCMessage `json:"messages"`
-	Tools       []any       `json:"tools"`
-	System      string      `json:"system"`
-	MaxTokens   int         `json:"max_tokens"`
-	Stream      bool        `json:"stream"`
-	Temperature *float64    `json:"temperature,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []CCMessage     `json:"messages"`
+	Tools       []CCTool        `json:"tools"`
+	System      []CCSystemBlock `json:"system"`
+	MaxTokens   int             `json:"max_tokens"`
+	Stream      bool            `json:"stream"`
+	Temperature *float64        `json:"temperature,omitempty"`
 }
 
 type CCConfig struct {
@@ -51,24 +69,17 @@ type CCConfig struct {
 
 type CCRequestBody struct {
 	// Field order and nullability mirror the official CLI's /alpha/generate
-	// wire body exactly (see buildCommandAuthHeaders/postStream in
-	// command-code dist/cli.mjs): memory/taste/skills are JSON null when
-	// unused, threadId is omitted (toWireThreadId drops non-uuid ids, and
-	// the CLI session id "sess_..." never qualifies), and promptCache is
-	// absent on chat calls.
+	// wire body exactly (authoritative tap capture of command-code 1.50.1):
+	// memory/taste/skills are JSON null when unused, threadId carries the
+	// per-conversation uuid (identical to the x-session-id header), there is
+	// no mode key on chat calls, and promptCache is absent.
 	Config         CCConfig     `json:"config"`
 	Memory         *string      `json:"memory"`
 	Taste          *string      `json:"taste"`
 	Skills         *string      `json:"skills"`
 	PermissionMode string       `json:"permissionMode"`
-	ThreadID       string       `json:"threadId,omitempty"`
-	Mode           string       `json:"mode"`
+	ThreadID       string       `json:"threadId"`
 	Params         CCChatParams `json:"params"`
-
-	// Session carries the CLI-style "sess_..." id for the x-session-id
-	// header. It is deliberately not serialized: the real CLI sends
-	// threadId only when it is a uuid, and its session id never is.
-	Session string `json:"-"`
 }
 
 type CCStreamEvent struct {

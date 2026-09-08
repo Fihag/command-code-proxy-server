@@ -6,6 +6,8 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +21,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// Transport performs POST requests to the CommandCode API over a raw
+// Transport performs requests to the CommandCode API over a raw
 // HTTP/1.1 connection whose TLS handshake and request line/header order
 // mirror the official CLI's Node fetch (undici) behavior. It implements
 // http.RoundTripper so it can be plugged into the standard http.Client.
@@ -64,7 +66,7 @@ func (t *Transport) timeouts() (time.Duration, time.Duration) {
 	return d, h
 }
 
-// RoundTrip issues req (must be POST) and returns the response. The
+// RoundTrip issues req and returns the response. The
 // returned response body, when fully drained without error, puts the
 // underlying connection back into the pool; on any error the connection
 // is closed.
@@ -183,15 +185,28 @@ func (t *Transport) acquire(ctx context.Context, addr string) (*pooledConn, bool
 	return pc, true, nil
 }
 
-// writeRequest serializes the request exactly in the field order that
-// Node's undici (the CLI's HTTP client) uses on the wire: request line,
-// host, connection, the CLI's auth headers, then the fetch-mandated
-// accept/accept-language/sec-fetch-mode/accept-encoding, then
-// content-length. net/http would sort headers alphabetically and emit
-// Go-style casing — that ordering itself is a fingerprint.
+// writeRequest serializes the request exactly as the CLI's Node 24 undici
+// does on the wire. The header set and order are endpoint-specific (each
+// CLI call site builds its own header object) — captured via tools/tap from
+// the real command-code 1.50.1:
+//
+//	/alpha/generate           content-type, User-Agent, x-command-code-version,
+//	                          x-cli-environment, x-project-slug, x-taste-learning,
+//	                          x-session-id, Authorization, traceparent
+//	/alpha/lifecycle-events   content-type, x-cli-environment, Authorization,
+//	                          User-Agent, x-command-code-version
+//	/alpha/fingerprint/record content-type, Authorization, x-cli-environment,
+//	                          x-command-code-version, User-Agent
+//
+// content-type arrives lowercase and its value is doubled ("application/json,
+// application/json") on every endpoint except fingerprint, because the CLI
+// sets it both in its header bag and via the fetch body option and undici
+// joins the two. net/http would sort headers alphabetically with Go casing —
+// that ordering difference is itself a fingerprint.
 func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 	var b strings.Builder
-	b.WriteString("POST ")
+	b.WriteString(req.Method)
+	b.WriteString(" ")
 	b.WriteString(req.URL.RequestURI())
 	b.WriteString(" HTTP/1.1\r\n")
 
@@ -201,43 +216,56 @@ func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 		b.WriteString(value)
 		b.WriteString("\r\n")
 	}
+	h := req.Header
+	wireIf := func(wireName, headerName string) {
+		if v := h.Get(headerName); v != "" {
+			wire(wireName, v)
+		}
+	}
 
 	wire("host", req.URL.Host)
 	wire("connection", "keep-alive")
 
-	// Custom headers, in the order buildCommandAuthHeaders builds them.
-	h := req.Header
-	wireOrdered := func(name string) {
-		if v := h.Get(name); v != "" {
-			wire(strings.ToLower(name), v)
+	ct := h.Get("Content-Type")
+	ctDoubled := ct
+	if ct == "application/json" {
+		ctDoubled = "application/json, application/json"
+	}
+
+	switch req.URL.Path {
+	case "/alpha/generate":
+		wire("content-type", ctDoubled)
+		wireIf("User-Agent", "User-Agent")
+		wireIf("x-command-code-version", "X-Command-Code-Version")
+		wireIf("x-cli-environment", "X-Cli-Environment")
+		wireIf("x-project-slug", "X-Project-Slug")
+		wireIf("x-taste-learning", "X-Taste-Learning")
+		wireIf("x-session-id", "X-Session-Id")
+		wireIf("Authorization", "Authorization")
+		wire("traceparent", newTraceparent())
+	default: // lifecycle / fingerprint / whoami share one shape family
+		if req.URL.Path == "/alpha/fingerprint/record" {
+			wire("content-type", ct)
+			wireIf("Authorization", "Authorization")
+			wireIf("x-cli-environment", "X-Cli-Environment")
+			wireIf("x-command-code-version", "X-Command-Code-Version")
+			wireIf("User-Agent", "User-Agent")
+		} else {
+			wire("content-type", ctDoubled)
+			wireIf("x-cli-environment", "X-Cli-Environment")
+			wireIf("Authorization", "Authorization")
+			wireIf("User-Agent", "User-Agent")
+			wireIf("x-command-code-version", "X-Command-Code-Version")
 		}
-	}
-	// Content-Type and User-Agent come first in undici's fetch spec
-	// ordering, then the custom x-headers, then Authorization.
-	if ct := h.Get("Content-Type"); ct != "" {
-		wire("Content-Type", ct)
-	}
-	if ua := h.Get("User-Agent"); ua != "" {
-		wire("User-Agent", ua)
-	}
-	for _, name := range []string{
-		"X-Command-Code-Version",
-		"X-Cli-Environment",
-		"X-Project-Slug",
-		"X-Taste-Learning",
-		"X-Session-Id",
-	} {
-		wireOrdered(name)
-	}
-	if auth := h.Get("Authorization"); auth != "" {
-		wire("Authorization", auth)
 	}
 
 	wire("accept", "*/*")
 	wire("accept-language", "*")
 	wire("sec-fetch-mode", "cors")
 	wire("accept-encoding", "br, gzip, deflate")
-	fmt.Fprintf(&b, "content-length: %d\r\n", len(body))
+	if len(body) > 0 || req.Method == http.MethodPost {
+		fmt.Fprintf(&b, "content-length: %d\r\n", len(body))
+	}
 	b.WriteString("\r\n")
 
 	if _, err := io.WriteString(w, b.String()); err != nil {
@@ -249,6 +277,20 @@ func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 		}
 	}
 	return nil
+}
+
+// newTraceparent emits a W3C trace context header the CLI's chat span
+// generator produces: "00-<32 hex trace id>-<16 hex span id>-01".
+func newTraceparent() string {
+	var t [16]byte
+	var s [8]byte
+	if _, err := crand.Read(t[:]); err != nil {
+		panic(err)
+	}
+	if _, err := crand.Read(s[:]); err != nil {
+		panic(err)
+	}
+	return "00-" + hex.EncodeToString(t[:]) + "-" + hex.EncodeToString(s[:]) + "-01"
 }
 
 func (t *Transport) exchange(req *http.Request, pc *pooledConn, body []byte, fresh bool) (*http.Response, error) {
