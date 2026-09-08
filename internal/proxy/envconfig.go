@@ -3,6 +3,7 @@ package proxy
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -32,20 +33,28 @@ var (
 )
 
 // cliWorkDir resolves the directory the config snapshot (and slug) report.
+// Relative inputs are made absolute: the CLI always reports a real cwd, and
+// a literal "." would both leak through config.workingDir and collapse the
+// slug to the "cli" fallback.
 func cliWorkDir() string {
 	workDirMu.Lock()
 	ov := workDirOverride
 	workDirMu.Unlock()
-	if ov != "" {
-		return ov
+	dir := ov
+	if dir == "" {
+		dir = os.Getenv("COMMANDCODE_WORKING_DIR")
 	}
-	if v := os.Getenv("COMMANDCODE_WORKING_DIR"); v != "" {
-		return v
+	if dir == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dir = home
+		} else {
+			dir = "."
+		}
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return home
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
 	}
-	return "."
+	return dir
 }
 
 // structureNoise mirrors the CLI's _w exclusion set.

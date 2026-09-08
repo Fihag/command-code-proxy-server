@@ -45,7 +45,7 @@ go run main.go [options]
 | `-port` | `55990` | Port to run the server on |
 | `-api-key` | empty | Optional default CommandCode API key (also via `COMMANDCODE_API_KEY`) |
 | `-project-slug` | derived from work dir | Value for the `x-project-slug` header |
-| `-workdir` | home dir / `COMMANDCODE_WORKING_DIR` | Directory reported in the request `config` snapshot (and auto `x-project-slug`) |
+| `-workdir` | home dir / `COMMANDCODE_WORKING_DIR` | Directory reported in the request `config` snapshot (and auto `x-project-slug`); relative paths are resolved to absolute |
 | `-version` | `false` | Print version and exit |
 
 > 上报的 `config` 快照含工作目录名、顶层文件列表与 git 状态。**切勿用本代理仓库目录启动**——否则每个请求都会上报一个叫 `command-code-proxy-server`、内含 `tools/tap`、`recapture.mjs` 的工程，等于自曝用途。默认取用户主目录（普通非 git 目录，与在 home 下运行 CLI 无异），或用 `-workdir` / `COMMANDCODE_WORKING_DIR` 指向任意中性项目目录；`x-project-slug` 始终由该目录推导，header 与 body 一致。

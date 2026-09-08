@@ -157,7 +157,7 @@ func (p *Proxy) SetWorkingDir(dir string) {
 	workDirOverride = dir
 	workDirMu.Unlock()
 	p.envCfg = newEnvConfigCache()
-	if slug := slugPath(dir); slug != "" {
+	if slug := slugPath(cliWorkDir()); slug != "" {
 		p.identity = newIdentity(slug)
 	}
 }
