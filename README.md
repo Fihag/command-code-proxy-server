@@ -43,9 +43,12 @@ go run main.go [options]
 | --- | --- | --- |
 | `-host` | `127.0.0.1` | Host to bind the server to |
 | `-port` | `55990` | Port to run the server on |
-| `-api-key` | empty | Optional default CommandCode API key |
-| `-project-slug` | current dir name | Value for the `x-project-slug` header (the CLI reports its project directory name) |
+| `-api-key` | empty | Optional default CommandCode API key (also via `COMMANDCODE_API_KEY`) |
+| `-project-slug` | derived from work dir | Value for the `x-project-slug` header |
+| `-workdir` | home dir / `COMMANDCODE_WORKING_DIR` | Directory reported in the request `config` snapshot (and auto `x-project-slug`) |
 | `-version` | `false` | Print version and exit |
+
+> 上报的 `config` 快照含工作目录名、顶层文件列表与 git 状态。**切勿用本代理仓库目录启动**——否则每个请求都会上报一个叫 `command-code-proxy-server`、内含 `tools/tap`、`recapture.mjs` 的工程，等于自曝用途。默认取用户主目录（普通非 git 目录，与在 home 下运行 CLI 无异），或用 `-workdir` / `COMMANDCODE_WORKING_DIR` 指向任意中性项目目录；`x-project-slug` 始终由该目录推导，header 与 body 一致。
 
 Examples:
 
@@ -274,4 +277,5 @@ The fetched version is cached for 30 minutes. If the registry request fails, the
 5. **立刻删除 hosts 里的重定向行并停掉探针。**
 6. 一键回灌三份基准数据：
    `node tools/recapture.mjs capture.jsonl`
-7. 重跑 `go test ./...`（测试会将传输层握手与该基准逐字段比对），然后重新构建二进制。
+7. 脚本末尾会打印捕获到的 `cliVersion`。若与 `internal/version/version.go` 的 `Baseline` 常量不同，**必须同步修改**：`x-command-code-version` 报的版本要与 TLS/头/工具所回放的行为版本一致，否则"新版 CLI 却发旧版行为"会被服务端交叉验证出来。版本不再从 npm 动态拉取，就是这个原因。
+8. 重跑 `go test ./...`（测试会将传输层握手与该基准逐字段比对），然后重新构建二进制。

@@ -60,3 +60,12 @@ console.log("body 顶层键序:", Object.keys(body).join(","));
 console.log("params 键序:", Object.keys(body.params).join(","));
 console.log("x-project-slug:", heads.find((h) => h.startsWith("x-project-slug")));
 console.log("threadId:", body.threadId);
+
+// 5) 版本基线：x-command-code-version 与行为基准必须同版本，否则"新版 CLI
+// 却发旧版行为"是可交叉验证的矛盾。捕获到新版本时必须同步改这里。
+const verLine = heads.find((h) => h.toLowerCase().startsWith("x-command-code-version:"));
+const ver = verLine ? verLine.split(":")[1].trim() : "(缺失)";
+console.log(
+  `\n捕获 cliVersion: ${ver}\n` +
+  `>>> 若与 internal/version/version.go 的 Baseline 不同，请同步修改 Baseline 常量 <<<`
+);

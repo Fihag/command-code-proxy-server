@@ -17,8 +17,9 @@ const debugLogging = false
 func main() {
 	port := flag.String("port", "", "监听端口 (默认: 55990)")
 	host := flag.String("host", "", "绑定地址 (默认: 127.0.0.1)")
-	apiKeyFlag := flag.String("api-key", "", "CommandCode API 密钥 (可选, 也可通过 Authorization 请求头传入)")
-	projectSlug := flag.String("project-slug", "", "上报给上游的项目名 x-project-slug (默认: 当前目录名)")
+	apiKeyFlag := flag.String("api-key", "", "CommandCode API 密钥 (可选, 也可通过 COMMANDCODE_API_KEY 环境变量或 Authorization 请求头传入)")
+	projectSlug := flag.String("project-slug", "", "上报给上游的项目名 x-project-slug (默认: 由工作目录推导)")
+	workDir := flag.String("workdir", "", "上报给上游 config 快照的工作目录 (默认: COMMANDCODE_WORKING_DIR 或用户主目录; 切勿用本代理仓库目录启动)")
 	showVersion := flag.Bool("version", false, "打印版本号后退出")
 	flag.Parse()
 
@@ -33,12 +34,16 @@ func main() {
 		return
 	}
 
-	proxy := proxy.NewProxy(*apiKeyFlag)
+	proxy := proxy.NewProxy(key)
+	if *workDir != "" {
+		proxy.SetWorkingDir(*workDir) // config 快照与 x-project-slug 同源
+	}
 	proxy.StartBeacon(key) // 启动时按真 CLI 的上报序列注册会话与设备指纹
 	proxy.Debug = debugLogging
 	if *projectSlug != "" {
 		proxy.SetProjectSlug(*projectSlug)
 	}
+	proxy.StartModelRefresher() // 仅在生产入口启动, 单元测试不触网/不污染全局目录
 
 	srv := server.NewServer(proxy)
 	srv.SetPort(*port)

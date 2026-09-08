@@ -118,6 +118,10 @@ type Proxy struct {
 	identity   *identity
 	envCfg     *envConfigCache
 	beaconOnce sync.Once
+	// beaconGate is closed when the startup beacon sequence has run to
+	// completion (success or exhausted retries); generate requests wait on it
+	// so their birth events are never seen out of order.
+	beaconGate chan struct{}
 }
 
 func (p *Proxy) beaconCtx() context.Context {
@@ -128,21 +132,34 @@ func (p *Proxy) beaconCtx() context.Context {
 
 // NewProxy creates a new proxy instance
 func NewProxy(apiKey string) *Proxy {
-	p := &Proxy{
-		APIKey:   apiKey,
-		BaseURL:  defaultBaseURL,
-		Client:   &http.Client{Timeout: defaultTimeout, Transport: upstream.New()},
-		identity: newIdentity(""),
-		envCfg:   newEnvConfigCache(),
+	return &Proxy{
+		APIKey:     apiKey,
+		BaseURL:    defaultBaseURL,
+		Client:     &http.Client{Timeout: defaultTimeout, Transport: upstream.New()},
+		identity:   newIdentity(""),
+		envCfg:     newEnvConfigCache(),
+		beaconGate: make(chan struct{}),
 	}
-	p.StartModelRefresher()
-	return p
 }
 
 // SetProjectSlug overrides the x-project-slug value sent upstream (the CLI
-// sends the current project directory name). Empty keeps the auto value.
+// sends the slugified project directory). Empty keeps the auto value.
 func (p *Proxy) SetProjectSlug(slug string) {
 	p.identity = newIdentity(slug)
+}
+
+// SetWorkingDir overrides the directory the config snapshot reports upstream
+// and, with it, the auto x-project-slug (header and body stay in sync). Call
+// before serving; it exists so the proxy can run from anywhere without its
+// own repo name showing up in every generate body.
+func (p *Proxy) SetWorkingDir(dir string) {
+	workDirMu.Lock()
+	workDirOverride = dir
+	workDirMu.Unlock()
+	p.envCfg = newEnvConfigCache()
+	if slug := slugPath(dir); slug != "" {
+		p.identity = newIdentity(slug)
+	}
 }
 
 // BuildRequest builds the CommandCode request body
@@ -249,17 +266,21 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get API key from client Authorization header or server default
+	// Get API key from client Authorization header or server default. A
+	// present-but-empty bearer token ("Bearer ") must fall back too, not be
+	// forwarded upstream as an empty key.
 	apiKey := r.Header.Get("Authorization")
 	if apiKey != "" {
-		apiKey = strings.TrimPrefix(apiKey, "Bearer ")
-		apiKey = strings.TrimSpace(apiKey)
-	} else if p.APIKey != "" {
+		apiKey = strings.TrimSpace(strings.TrimPrefix(apiKey, "Bearer "))
+	}
+	if apiKey == "" {
 		apiKey = p.APIKey
-	} else {
+	}
+	if apiKey == "" {
 		p.writeOpenAIError(w, http.StatusUnauthorized, "API key required. Set Authorization header.", "authentication_error")
 		return
 	}
+	p.StartBeacon(apiKey)
 
 	// Read request
 	body, err := io.ReadAll(r.Body)
@@ -295,6 +316,11 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The real CLI always reports its birth (whoami/lifecycle/fingerprint)
+	// before any generate: hold the first request until the beacon sequence
+	// has run, then forward.
+	p.awaitBeacon(r.Context())
+
 	// Call upstream
 	ccResp, err := p.CallUpstream(ccReq)
 	if err != nil {
@@ -302,8 +328,6 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ccResp.Body.Close()
-
-	p.StartBeacon(apiKey)
 
 	if ccResp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(ccResp.Body)
@@ -345,6 +369,8 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	sentRole := false
 	toolCallIndex := 0
 	toolCallIndexes := map[string]int{}
+	finishSent := false
+	sawToolCalls := false
 
 	for scanner.Scan() {
 		select {
@@ -380,8 +406,18 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			})
 
 		case "tool-use":
+			// Register the id just like tool-input-start/tool-call do, so an
+			// aggregated tool-call event for the same call is recognised as
+			// already streamed instead of emitted again on a new index.
+			if _, ok := toolCallIndexes[event.ToolCallID]; ok {
+				continue
+			}
+			toolCallIndexes[event.ToolCallID] = toolCallIndex
+			idx := toolCallIndex
+			toolCallIndex++
+			sawToolCalls = true
 			toolCalls := []api.OpenAIDeltaToolCall{{
-				Index:    toolCallIndex,
+				Index:    idx,
 				ID:       event.ToolCallID,
 				Type:     "function",
 				Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
@@ -398,7 +434,6 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				Model:   model,
 				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
 			})
-			toolCallIndex++
 
 		case "tool-delta":
 			toolCalls := []api.OpenAIDeltaToolCall{{
@@ -414,6 +449,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			})
 
 		case "tool-input-start":
+			sawToolCalls = true
 			if _, ok := toolCallIndexes[event.ID]; !ok {
 				toolCallIndexes[event.ID] = toolCallIndex
 				toolCallIndex++
@@ -457,6 +493,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			})
 
 		case "tool-call":
+			sawToolCalls = true
 			if _, alreadyStreamed := toolCallIndexes[event.ToolCallID]; alreadyStreamed {
 				continue
 			}
@@ -505,14 +542,51 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			})
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
+			finishSent = true
 
 		case "error":
 			log.Printf("[错误] 流式响应出错: %v", event.Error)
+			msg := "upstream stream error"
+			if event.Error != nil && event.Error.Message != "" {
+				msg = redactSecrets(event.Error.Message)
+			}
+			// Error frames inside the stream are how litellm-style gateways
+			// report mid-stream failures; OpenAI SDKs surface them as API
+			// errors. The finish/[DONE] tail below still closes the stream.
+			frame, _ := json.Marshal(map[string]any{
+				"error": map[string]any{"message": msg, "type": "api_error"},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", frame)
+			flusher.Flush()
 		}
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF {
 		log.Printf("[错误] 流读取失败: %v", err)
+	}
+
+	// Upstream ended without a finish event (connection dropped mid-stream,
+	// or the server closed right after an error event): a stream that never
+	// says [DONE] leaves well-behaved OpenAI clients hanging on read. Close
+	// the protocol on our own so the client always terminates cleanly.
+	if !finishSent {
+		reason := "stop"
+		if sawToolCalls {
+			reason = "tool_calls"
+		}
+		p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+			ID:      requestID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []api.OpenAIChoice{{
+				Index:        0,
+				Delta:        &api.OpenAIDelta{},
+				FinishReason: &reason,
+			}},
+		})
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
 	}
 }
 
@@ -532,6 +606,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
+	var upstreamErrMsg string
 	toolCallByID := map[string]int{}
 	toolInputBuffers := map[string]*strings.Builder{}
 
@@ -615,7 +690,26 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 			}
 		case "error":
 			log.Printf("[错误] 流式响应出错: %v", event.Error)
+			if upstreamErrMsg == "" {
+				if event.Error != nil && event.Error.Message != "" {
+					upstreamErrMsg = redactSecrets(event.Error.Message)
+				} else {
+					upstreamErrMsg = "upstream stream error"
+				}
+			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		log.Printf("[错误] 流读取失败: %v", err)
+	}
+
+	// An upstream error must never be answered with an HTTP 200 holding an
+	// empty message and zero usage — clients would record it as a real
+	// completion. Propagate it as an error instead.
+	if upstreamErrMsg != "" {
+		p.writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+upstreamErrMsg, "api_error")
+		return
 	}
 
 	msg := &api.OpenAIMessage{
@@ -756,7 +850,7 @@ func responseItemsToMessages(items []any) []api.OpenAIMessage {
 func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 	data := staticModels()
 	if catalog.isLoaded() {
-		data = catalogModels()
+		data = catalog.openAIModels()
 	}
 	models := api.OpenAIModelList{
 		Object: "list",

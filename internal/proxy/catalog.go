@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
+	"github.com/dev2k6/command-code-proxy-server/internal/upstream"
 )
 
 const (
@@ -140,15 +141,31 @@ func parseModelIDs(html string) []string {
 	return ids
 }
 
+// catalogClient fetches the docs page over the same utls transport used for
+// the API: the default Go handshake is a Go JA3/JA4, and commandcode.ai is
+// behind the same edge as api.commandcode.ai — a fingerprint the CLI never
+// shows, re-sent every 6 hours.
+var catalogClient = &http.Client{
+	Timeout:   60 * time.Second,
+	Transport: upstream.New(),
+}
+
 // fetchModelIDs fetches the CommandCode models reference page and parses the
 // model ids out of it.
 func fetchModelIDs() ([]string, error) {
-	return fetchModelIDsFrom(modelCatalogURL)
+	return fetchModelIDsFrom(catalogClient, modelCatalogURL)
 }
 
-// fetchModelIDsFrom fetches url and parses model ids out of the response.
-func fetchModelIDsFrom(url string) ([]string, error) {
-	resp, err := http.Get(url)
+// fetchModelIDsFrom fetches url with the given client and parses model ids.
+// The client is a parameter so tests can pass a plain http.Client pointed at
+// an httptest server (the production catalogClient is https-only utls).
+func fetchModelIDsFrom(client *http.Client, url string) ([]string, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build catalog request: %w", err)
+	}
+	req.Header.Set("User-Agent", "cli")
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch model catalog: %w", err)
 	}
@@ -198,9 +215,11 @@ func ownedByFor(id string) string {
 	return "commandcode"
 }
 
-// catalogModels builds the OpenAI-compatible model list from the catalog.
-func catalogModels() []api.OpenAIModel {
-	ids := catalog.idList()
+// openAIModels builds the OpenAI-compatible model list from this catalog. A
+// method so callers (and tests) decide which instance they read — mutating
+// the process-wide singleton in one test must not leak into another.
+func (c *modelCatalog) openAIModels() []api.OpenAIModel {
+	ids := c.idList()
 	out := make([]api.OpenAIModel, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, api.OpenAIModel{

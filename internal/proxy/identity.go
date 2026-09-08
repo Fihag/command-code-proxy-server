@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -76,10 +75,8 @@ type identityEntry struct {
 func newIdentity(slug string) *identity {
 	if slug == "" {
 		slug = "cli"
-		if wd, err := os.Getwd(); err == nil {
-			if s := slugPath(wd); s != "" {
-				slug = s
-			}
+		if s := slugPath(cliWorkDir()); s != "" {
+			slug = s
 		}
 	}
 	return &identity{

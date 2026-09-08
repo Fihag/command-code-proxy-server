@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,6 +46,11 @@ func nodeOSArch() string {
 	return nodePlatform() + "-" + arch
 }
 
+const (
+	beaconAttempts = 3                // whole-sequence attempts per process
+	beaconWaitMax  = 12 * time.Second // max a generate request waits for the gate
+)
+
 // StartBeacon fires the startup sequence at most once per process. Safe to
 // call on every request; the first call with a usable key wins. main.go calls
 // it once at startup when a server key is configured; the chat handler calls
@@ -58,43 +64,89 @@ func (p *Proxy) StartBeacon(apiKey string) {
 	})
 }
 
-func (p *Proxy) runBeacon(apiKey string) {
-	// Give the first generate request the connection's head start; the CLI's
-	// beacon happens before any chat anyway, but ordering by microseconds is
-	// invisible to the server while blocking user traffic would not be.
-	time.Sleep(2 * time.Second)
-
-	// 1. whoami (GET, no body).
-	if err := p.beaconCall(http.MethodGet, "/alpha/whoami", nil, apiKey); err != nil {
-		log.Printf("[信标] whoami 失败: %v", err)
-		return
+// awaitBeacon blocks (bounded) until the beacon sequence has finished, so no
+// generate ever reaches the server before its own birth events. The real CLI
+// beacons strictly before its first request (capture order: whoami →
+// lifecycle-events → fingerprint/record → generate); an inverted order is a
+// visible anomaly, hence waiting here instead of racing. After the gate is
+// closed this returns immediately; the timeout only bounds pathological
+// network stalls so user traffic is never blocked forever.
+func (p *Proxy) awaitBeacon(ctx context.Context) {
+	select {
+	case <-p.beaconGate:
+	case <-time.After(beaconWaitMax):
+	case <-ctx.Done():
 	}
+}
 
-	// 2. lifecycle-events: cli_session_exists for this process session.
+// runBeacon reports the startup sequence. Each step is independent — a
+// failed whoami must not silently skip the lifecycle birth event — and every
+// unfinished step is retried across whole-sequence attempts. Succeeded steps
+// are never re-sent: the CLI posts cli_session_exists exactly once per
+// process, and duplicates are their own anomaly.
+func (p *Proxy) runBeacon(apiKey string) {
+	defer close(p.beaconGate)
+
 	ev := lifecycleEvent{EventType: "cli_session_exists"}
 	ev.Metadata.SessionID = p.identity.processSess
 	ev.Metadata.CLIVersion = version.GetCommandCodeVersion()
 	ev.Metadata.Mode = "non-interactive"
 	ev.Metadata.OS = nodeOSArch()
 	body, _ := json.Marshal(ev)
-	if err := p.beaconCall(http.MethodPost, "/alpha/lifecycle-events", body, apiKey); err != nil {
-		log.Printf("[信标] lifecycle-events 失败: %v", err)
+
+	// Fingerprint is a local-resource step: missing/invalid file is a
+	// permanent skip (retrying cannot help), so it starts settled.
+	fpBody, fpErr := os.ReadFile(fingerprintFile)
+	fpSettled := false
+	switch {
+	case fpErr != nil:
+		fpSettled = true
+		log.Printf("[信标] 未找到 %s, 跳过设备指纹上报 (tools/recapture.mjs 可生成)", fingerprintFile)
+	case !json.Valid(fpBody):
+		fpSettled = true
+		log.Printf("[信标] %s 不是合法 JSON, 跳过设备指纹上报", fingerprintFile)
+		fpBody = nil
 	}
 
-	// 3. fingerprint/record — only when the local capture file exists.
-	fp, err := os.ReadFile(fingerprintFile)
-	if err != nil {
-		log.Printf("[信标] 未找到 %s, 跳过设备指纹上报 (tools/recapture.mjs 可生成)", fingerprintFile)
-		return
+	var whoamiOK, lifeOK bool
+	for attempt := 1; attempt <= beaconAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt) * 3 * time.Second)
+		}
+		if !whoamiOK {
+			if err := p.beaconCall(http.MethodGet, "/alpha/whoami", nil, apiKey); err != nil {
+				log.Printf("[信标] whoami 失败 (第 %d/%d 次): %v", attempt, beaconAttempts, err)
+			} else {
+				whoamiOK = true
+			}
+		}
+		if !lifeOK {
+			if err := p.beaconCall(http.MethodPost, "/alpha/lifecycle-events", body, apiKey); err != nil {
+				log.Printf("[信标] lifecycle-events 失败 (第 %d/%d 次): %v", attempt, beaconAttempts, err)
+			} else {
+				lifeOK = true
+			}
+		}
+		if !fpSettled {
+			if err := p.beaconCall(http.MethodPost, "/alpha/fingerprint/record", fpBody, apiKey); err != nil {
+				log.Printf("[信标] fingerprint/record 失败 (第 %d/%d 次): %v", attempt, beaconAttempts, err)
+			} else {
+				fpSettled = true
+			}
+		}
+		if whoamiOK && lifeOK && fpSettled {
+			break
+		}
 	}
-	if !json.Valid(fp) {
-		log.Printf("[信标] %s 不是合法 JSON, 跳过设备指纹上报", fingerprintFile)
-		return
-	}
-	if err := p.beaconCall(http.MethodPost, "/alpha/fingerprint/record", fp, apiKey); err != nil {
-		log.Printf("[信标] fingerprint/record 失败: %v", err)
+	if whoamiOK && lifeOK {
+		suffix := ""
+		if fpSettled && fpBody != nil {
+			suffix = "/fingerprint"
+		}
+		log.Printf("[信标] 启动信标已上报 (whoami/lifecycle%s)", suffix)
 	} else {
-		log.Printf("[信标] 启动信标已上报 (whoami/lifecycle/fingerprint)")
+		log.Printf("[信标] 警告: 启动信标未完整送达 (whoami=%v lifecycle=%v fingerprint=%v), 上游将缺少本会话出生记录",
+			whoamiOK, lifeOK, fpSettled)
 	}
 }
 

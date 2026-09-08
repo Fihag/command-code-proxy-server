@@ -3,7 +3,6 @@ package proxy
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -16,9 +15,38 @@ import (
 // The CLI attaches a per-request env snapshot (buildServerConfig in
 // command-code dist/cli.mjs) to every /alpha/generate call: the real cwd,
 // a sorted top-level directory listing with noise entries removed, and git
-// facts (branch, status, last commits). We collect the same data from the
-// proxy process's own working directory so the snapshot is self-consistent
-// with x-project-slug instead of placeholder values.
+// facts (branch, status, last commits).
+//
+// The snapshot directory is deliberately NOT the proxy's own cwd: launched
+// from this repo it would report a project literally named
+// command-code-proxy-server full of tools/tap and recapture.mjs — the config
+// block would self-describe the disguise. It defaults to the user's home
+// directory (a plain non-git folder, exactly like running the CLI there);
+// COMMANDCODE_WORKING_DIR or Proxy.SetWorkingDir point it at any neutral
+// project. x-project-slug is always derived from this same directory, so
+// header and body agree.
+
+var (
+	workDirMu       sync.Mutex
+	workDirOverride string // set by Proxy.SetWorkingDir before serving
+)
+
+// cliWorkDir resolves the directory the config snapshot (and slug) report.
+func cliWorkDir() string {
+	workDirMu.Lock()
+	ov := workDirOverride
+	workDirMu.Unlock()
+	if ov != "" {
+		return ov
+	}
+	if v := os.Getenv("COMMANDCODE_WORKING_DIR"); v != "" {
+		return v
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	return "."
+}
 
 // structureNoise mirrors the CLI's _w exclusion set.
 var structureNoise = map[string]bool{
@@ -80,10 +108,7 @@ func collectGit(dir string, args ...string) string {
 }
 
 func collectEnvConfig() api.CCConfig {
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
+	cwd := cliWorkDir()
 	cfg := api.CCConfig{
 		WorkingDir:  cwd,
 		Environment: nodePlatform(),
@@ -140,10 +165,4 @@ func topLevels(dir string) []string {
 		names = []string{}
 	}
 	return names
-}
-
-// projectSlugFor derives the x-project-slug the same way the CLI does:
-// the base name of the working directory.
-func projectSlugFor(dir string) string {
-	return filepath.Base(dir)
 }

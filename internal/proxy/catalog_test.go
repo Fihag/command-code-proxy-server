@@ -107,11 +107,14 @@ func TestMapModelUsesCatalog(t *testing.T) {
 
 func TestFetchModelIDsFrom(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "cli" {
+			t.Errorf("catalog fetch User-Agent = %q, want cli", got)
+		}
 		w.Write([]byte(testCatalogHTML))
 	}))
 	defer srv.Close()
 
-	ids, err := fetchModelIDsFrom(srv.URL)
+	ids, err := fetchModelIDsFrom(srv.Client(), srv.URL)
 	if err != nil {
 		t.Fatalf("fetchModelIDsFrom failed: %v", err)
 	}
@@ -126,14 +129,17 @@ func TestFetchModelIDsFromError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := fetchModelIDsFrom(srv.URL); err == nil {
+	if _, err := fetchModelIDsFrom(srv.Client(), srv.URL); err == nil {
 		t.Fatal("expected error for non-200 response")
 	}
 }
 
 func TestCatalogModelsBuildsList(t *testing.T) {
-	catalog.update([]string{"deepseek/deepseek-v4-pro", "claude-sonnet-5"})
-	models := catalogModels()
+	// Local instance: the old test mutated the process-wide singleton and
+	// leaked a loaded catalog into every later test that hits MapModel.
+	c := &modelCatalog{}
+	c.update([]string{"deepseek/deepseek-v4-pro", "claude-sonnet-5"})
+	models := c.openAIModels()
 	if len(models) != 2 {
 		t.Fatalf("catalogModels returned %d models, want 2", len(models))
 	}

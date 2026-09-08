@@ -365,22 +365,55 @@ func TestLifecycleFingerprintWhoamiTemplates(t *testing.T) {
 		Transport: &Transport{InsecureSkipVerify: true},
 		Timeout:   10 * time.Second,
 	}
+	// Full expected wire lines (after the request line + host + connection)
+	// for each beacon endpoint, taken verbatim from the tools/tap capture.
+	// whoami is a GET with no body yet still carries the doubled content-type
+	// the CLI's header object sets — that is real undici behaviour, confirmed
+	// against the authoritative 1.50.1 capture.
+	const tail = "accept: */*\r\n" +
+		"accept-language: *\r\n" +
+		"sec-fetch-mode: cors\r\n" +
+		"accept-encoding: br, gzip, deflate\r\n"
+
 	type headCase struct {
-		path string
-		head []string
+		method, path string
+		withBody     bool
+		want         string // full request text after host+connection lines
 	}
 	cases := []headCase{
 		{
-			path: "/alpha/lifecycle-events",
-			head: []string{"content-type: application/json, application/json", "x-cli-environment: production", "Authorization: Bearer sk-test", "User-Agent: cli", "x-command-code-version: 1.50.1"},
+			method: "GET", path: "/alpha/whoami", withBody: false,
+			want: "content-type: application/json, application/json\r\n" +
+				"x-cli-environment: production\r\n" +
+				"Authorization: Bearer sk-test\r\n" +
+				"User-Agent: cli\r\n" +
+				"x-command-code-version: 1.50.1\r\n" + tail,
 		},
 		{
-			path: "/alpha/fingerprint/record",
-			head: []string{"content-type: application/json", "Authorization: Bearer sk-test", "x-cli-environment: production", "x-command-code-version: 1.50.1", "User-Agent: cli"},
+			method: "POST", path: "/alpha/lifecycle-events", withBody: true,
+			want: "content-type: application/json, application/json\r\n" +
+				"x-cli-environment: production\r\n" +
+				"Authorization: Bearer sk-test\r\n" +
+				"User-Agent: cli\r\n" +
+				"x-command-code-version: 1.50.1\r\n" + tail +
+				"content-length: 2\r\n",
+		},
+		{
+			method: "POST", path: "/alpha/fingerprint/record", withBody: true,
+			want: "content-type: application/json\r\n" +
+				"Authorization: Bearer sk-test\r\n" +
+				"x-cli-environment: production\r\n" +
+				"x-command-code-version: 1.50.1\r\n" +
+				"User-Agent: cli\r\n" + tail +
+				"content-length: 2\r\n",
 		},
 	}
 	for _, c := range cases {
-		req, _ := http.NewRequest("POST", "https://"+tp.addr+c.path, strings.NewReader(`{}`))
+		var reqBody io.Reader
+		if c.withBody {
+			reqBody = strings.NewReader(`{}`)
+		}
+		req, _ := http.NewRequest(c.method, "https://"+tp.addr+c.path, reqBody)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", "cli")
 		req.Header.Set("Authorization", "Bearer sk-test")
@@ -393,36 +426,26 @@ func TestLifecycleFingerprintWhoamiTemplates(t *testing.T) {
 		io.ReadAll(resp.Body)
 		resp.Body.Close()
 		got := <-tp.requestCh
+		// Compare everything after "host:" and "connection: keep-alive" —
+		// those two differ per test run (ephemeral port) and are asserted in
+		// the generate template test.
 		lines := strings.Split(got, "\r\n")
-		// skip request line, host, connection
-		if len(lines) < 3+len(c.head) {
-			t.Fatalf("%s: too few lines: %q", c.path, got)
+		if len(lines) < 1 || lines[0] != c.method+" "+c.path+" HTTP/1.1" {
+			t.Fatalf("%s request line: %q", c.path, lines[0])
 		}
-		for i, w := range c.head {
-			if lines[3+i] != w {
-				t.Errorf("%s line %d:\n got %q\nwant %q", c.path, 3+i, lines[3+i], w)
-			}
+		if !strings.HasPrefix(lines[1], "host:") || lines[2] != "connection: keep-alive" {
+			t.Fatalf("%s head lines: %q", c.path, lines[:3])
+		}
+		gotRest := strings.Join(lines[3:], "\r\n")
+		if !strings.HasPrefix(gotRest, c.want) {
+			t.Errorf("%s header block:\n got %q\nwant prefix %q", c.path, gotRest, c.want)
 		}
 		if strings.Contains(got, "traceparent:") {
 			t.Errorf("%s must not carry traceparent: %q", c.path, got)
 		}
-	}
-
-	// whoami: GET, no content-length at all.
-	req, _ := http.NewRequest("GET", "https://"+tp.addr+"/alpha/whoami", nil)
-	req.Header.Set("Authorization", "Bearer sk-test")
-	resp, err := cl.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.ReadAll(resp.Body)
-	resp.Body.Close()
-	got := <-tp.requestCh
-	if strings.Contains(got, "content-length:") {
-		t.Errorf("GET whoami must not send content-length: %q", got)
-	}
-	if lines := strings.Split(got, "\r\n"); !strings.HasPrefix(lines[0], "GET /alpha/whoami") {
-		t.Errorf("whoami request line: %q", lines[0])
+		if !c.withBody && strings.Contains(gotRest, "content-length:") {
+			t.Errorf("GET whoami must not send content-length: %q", gotRest)
+		}
 	}
 }
 
