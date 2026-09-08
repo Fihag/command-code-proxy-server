@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
+	"github.com/dev2k6/command-code-proxy-server/internal/upstream"
 	"github.com/dev2k6/command-code-proxy-server/internal/version"
 	"github.com/google/uuid"
 )
@@ -73,7 +74,7 @@ func NewProxy(apiKey string) *Proxy {
 	p := &Proxy{
 		APIKey:   apiKey,
 		BaseURL:  defaultBaseURL,
-		Client:   &http.Client{Timeout: defaultTimeout},
+		Client:   &http.Client{Timeout: defaultTimeout, Transport: upstream.New()},
 		identity: newIdentity(""),
 		envCfg:   newEnvConfigCache(),
 	}
@@ -150,7 +151,8 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	ccReq.Header.Set("Authorization", "Bearer "+apiKey)
 	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
 	ccReq.Header.Set("x-cli-environment", "production")
-	ccReq.Header.Set("Accept", "text/event-stream")
+	// 不设置 Accept: text/event-stream —— 真实 CLI 的 fetch 在 wire 上发的是
+	// "accept: */*", 该头由传输层 (internal/upstream) 直接按序输出。
 	// Headers the official CLI attaches to every /alpha/generate call;
 	// without them the upstream sees Go's default User-Agent and no session
 	// correlation at all (see internal/proxy/identity.go).
