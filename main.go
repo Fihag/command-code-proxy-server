@@ -38,11 +38,13 @@ func main() {
 	if *workDir != "" {
 		proxy.SetWorkingDir(*workDir) // config 快照与 x-project-slug 同源
 	}
-	proxy.StartBeacon(key) // 启动时按真 CLI 的上报序列注册会话与设备指纹
-	proxy.Debug = debugLogging
 	if *projectSlug != "" {
 		proxy.SetProjectSlug(*projectSlug)
 	}
+	proxy.Debug = debugLogging
+	// StartBeacon 之后再不得替换 identity/envCfg：runBeacon 无锁读取
+	// processSess，setter 整体替换指针，先改完再信标。
+	proxy.StartBeacon(key)      // 启动时按真 CLI 的上报序列注册会话与设备指纹
 	proxy.StartModelRefresher() // 仅在生产入口启动, 单元测试不触网/不污染全局目录
 
 	srv := server.NewServer(proxy)

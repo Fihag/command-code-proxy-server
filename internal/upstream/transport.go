@@ -234,7 +234,9 @@ func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 
 	switch req.URL.Path {
 	case "/alpha/generate":
-		wire("content-type", ctDoubled)
+		if ct != "" {
+			wire("content-type", ctDoubled)
+		}
 		wireIf("User-Agent", "User-Agent")
 		wireIf("x-command-code-version", "X-Command-Code-Version")
 		wireIf("x-cli-environment", "X-Cli-Environment")
@@ -245,13 +247,17 @@ func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 		wire("traceparent", newTraceparent())
 	default: // lifecycle / fingerprint / whoami share one shape family
 		if req.URL.Path == "/alpha/fingerprint/record" {
-			wire("content-type", ct)
+			if ct != "" {
+				wire("content-type", ct)
+			}
 			wireIf("Authorization", "Authorization")
 			wireIf("x-cli-environment", "X-Cli-Environment")
 			wireIf("x-command-code-version", "X-Command-Code-Version")
 			wireIf("User-Agent", "User-Agent")
 		} else {
-			wire("content-type", ctDoubled)
+			if ct != "" {
+				wire("content-type", ctDoubled)
+			}
 			wireIf("x-cli-environment", "X-Cli-Environment")
 			wireIf("Authorization", "Authorization")
 			wireIf("User-Agent", "User-Agent")

@@ -15,7 +15,10 @@
 # OS files
 .DS_Store
 Thumbs.db
-bin/*.~
+bin/*~
 
 # 本机设备指纹（含哈希，绝不入库）
 fingerprint.json
+
+# tools/tap 重捕获产物（含完整请求体/提示词，绝不在仓库停留）
+capture*.jsonl
