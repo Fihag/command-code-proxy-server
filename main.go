@@ -17,6 +17,7 @@ func main() {
 	port := flag.String("port", "", "监听端口 (默认: 55990)")
 	host := flag.String("host", "", "绑定地址 (默认: 127.0.0.1)")
 	apiKey := flag.String("api-key", "", "CommandCode API 密钥 (可选, 也可通过 Authorization 请求头传入)")
+	projectSlug := flag.String("project-slug", "", "上报给上游的项目名 x-project-slug (默认: 当前目录名)")
 	showVersion := flag.Bool("version", false, "打印版本号后退出")
 	flag.Parse()
 
@@ -27,6 +28,9 @@ func main() {
 
 	proxy := proxy.NewProxy(*apiKey)
 	proxy.Debug = debugLogging
+	if *projectSlug != "" {
+		proxy.SetProjectSlug(*projectSlug)
+	}
 
 	srv := server.NewServer(proxy)
 	srv.SetPort(*port)

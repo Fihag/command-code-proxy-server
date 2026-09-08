@@ -44,6 +44,7 @@ go run main.go [options]
 | `-host` | `127.0.0.1` | Host to bind the server to |
 | `-port` | `55990` | Port to run the server on |
 | `-api-key` | empty | Optional default CommandCode API key |
+| `-project-slug` | current dir name | Value for the `x-project-slug` header (the CLI reports its project directory name) |
 | `-version` | `false` | Print version and exit |
 
 Examples:

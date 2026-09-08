@@ -60,21 +60,29 @@ func normalizeFinishReason(reason string) string {
 
 // Proxy struct
 type Proxy struct {
-	APIKey  string
-	BaseURL string
-	Client  *http.Client
-	Debug   bool
+	APIKey   string
+	BaseURL  string
+	Client   *http.Client
+	Debug    bool
+	identity *identity
 }
 
 // NewProxy creates a new proxy instance
 func NewProxy(apiKey string) *Proxy {
 	p := &Proxy{
-		APIKey:  apiKey,
-		BaseURL: defaultBaseURL,
-		Client:  &http.Client{Timeout: defaultTimeout},
+		APIKey:   apiKey,
+		BaseURL:  defaultBaseURL,
+		Client:   &http.Client{Timeout: defaultTimeout},
+		identity: newIdentity(""),
 	}
 	p.StartModelRefresher()
 	return p
+}
+
+// SetProjectSlug overrides the x-project-slug value sent upstream (the CLI
+// sends the current project directory name). Empty keeps the auto value.
+func (p *Proxy) SetProjectSlug(slug string) {
+	p.identity = newIdentity(slug)
 }
 
 // BuildRequest builds the CommandCode request body
@@ -121,7 +129,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 			Temperature: temperature,
 			Stream:      true,
 		},
-		ThreadID: uuid.New().String(),
+		ThreadID: p.identity.sessionFor(openAIReq),
 	}
 
 	return ccBody, nil
@@ -147,6 +155,13 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
 	ccReq.Header.Set("x-cli-environment", "production")
 	ccReq.Header.Set("Accept", "text/event-stream")
+	// Headers the official CLI attaches to every /alpha/generate call;
+	// without them the upstream sees Go's default User-Agent and no session
+	// correlation at all (see internal/proxy/identity.go).
+	ccReq.Header.Set("User-Agent", "cli")
+	ccReq.Header.Set("x-session-id", ccBody.ThreadID)
+	ccReq.Header.Set("x-project-slug", p.identity.slug)
+	ccReq.Header.Set("x-taste-learning", "false")
 
 	return ccReq, nil
 }
