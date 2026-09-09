@@ -10,7 +10,7 @@ import (
 	"github.com/dev2k6/command-code-proxy-server/internal/update"
 )
 
-const appVersion = "v1.0.8"
+const appVersion = "v1.1.0"
 const repositoryURL = "https://github.com/dev2k6/command-code-proxy-server"
 const debugLogging = false
 
