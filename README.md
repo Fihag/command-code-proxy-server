@@ -1,6 +1,8 @@
 # CommandCode Proxy Server
 
-OpenAI-compatible proxy server for the CommandCode API. It exposes `/v1/chat/completions` and `/v1/models` endpoints so OpenAI-compatible clients can call CommandCode models through a local HTTP server.
+**English** | [简体中文](README.zh-CN.md)
+
+OpenAI-compatible proxy server for the CommandCode API. It exposes `/v1/chat/completions` and `/v1/models` endpoints so OpenAI-compatible clients can call CommandCode models through a local HTTP server. Upstream traffic is shaped to match the official CLI's wire behaviour (TLS handshake, header order, session fields).
 
 Repository: https://github.com/dev2k6/command-code-proxy-server
 
@@ -12,7 +14,7 @@ Version: `v1.1.0`
 - Streaming and non-streaming responses
 - OpenAI-compatible model list endpoint
 - Short model name mapping
-- Optional default API key from CLI
+- Optional default API key from CLI or environment (`COMMANDCODE_API_KEY`)
 - Per-request API key via `Authorization` header
 - Configurable host and port
 - Checks GitHub tags for a newer proxy version and displays it next to the current version
@@ -48,7 +50,7 @@ go run main.go [options]
 | `-workdir` | home dir / `COMMANDCODE_WORKING_DIR` | Directory reported in the request `config` snapshot (and auto `x-project-slug`); relative paths are resolved to absolute |
 | `-version` | `false` | Print version and exit |
 
-> 上报的 `config` 快照含工作目录名、顶层文件列表与 git 状态。**切勿用本代理仓库目录启动**——否则每个请求都会上报一个叫 `command-code-proxy-server`、内含 `tools/tap`、`recapture.mjs` 的工程，等于自曝用途。默认取用户主目录（普通非 git 目录，与在 home 下运行 CLI 无异），或用 `-workdir` / `COMMANDCODE_WORKING_DIR` 指向任意中性项目目录；`x-project-slug` 始终由该目录推导，header 与 body 一致。
+> The `config` snapshot sent upstream contains the working directory name, its top-level file listing and git status. **Never launch the proxy from this repo's own directory** — every request would then report a project literally named `command-code-proxy-server` containing `tools/tap` and `recapture.mjs`, i.e. self-describing the proxy. It defaults to the user's home directory (a plain non-git folder, indistinguishable from running the CLI there); use `-workdir` / `COMMANDCODE_WORKING_DIR` to point it at any neutral project directory. `x-project-slug` is always derived from the same directory, so header and body agree.
 
 Examples:
 
@@ -74,26 +76,27 @@ go run main.go -version
 Build for the current platform:
 
 ```bash
-go build -o bin/command-code-proxy
+go build -trimpath -ldflags "-s -w" -o bin/command-code-proxy
 ```
 
-Cross-compile for Windows and Linux:
+Cross-compile the three shipped binaries:
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -o bin/command-code-proxy.exe
-GOOS=linux GOARCH=amd64 go build -o bin/command-code-proxy
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/command-code-proxy.exe
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/command-code-proxy
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o bin/command-code-proxy-arm64
 ```
 
 ## API key behavior
 
 The proxy uses the API key in this order:
 
-1. `Authorization` header from the incoming client request
+1. `Authorization` header from the incoming client request (a present-but-empty token such as `Bearer ` also falls back)
 2. `-api-key` CLI value, or the `COMMANDCODE_API_KEY` environment variable
 3. If neither exists, the request returns `401 Unauthorized`
 
-> 命令行参数会出现在进程列表与 shell 历史里；常驻服务建议改用环境变量：
-> `setx COMMANDCODE_API_KEY "..."`（新终端生效）。
+> Command-line arguments appear in the process list and shell history. For a long-running service prefer the environment variable:
+> `setx COMMANDCODE_API_KEY "..."` (takes effect in new terminals).
 
 Header format:
 
@@ -201,36 +204,32 @@ Unknown model names are passed through unchanged.
 
 ```text
 .
-├── README.md
-├── go.mod
-├── go.sum
-├── main.go
+├── README.md / README.zh-CN.md
+├── go.mod / go.sum / main.go
 ├── bin
-│   ├── command-code-proxy
-│   └── command-code-proxy.exe
-└── internal
-    ├── api
-    │   ├── commandcode.go
-    │   └── openai.go
-    ├── proxy
-    │   ├── catalog.go
-    │   ├── convert.go
-    │   ├── model.go
-    │   └── proxy.go
-    ├── server
-    │   └── server.go
-    ├── update
-    │   └── update.go
-    └── version
-        └── version.go
+│   ├── command-code-proxy           (linux amd64)
+│   ├── command-code-proxy-arm64     (linux arm64)
+│   └── command-code-proxy.exe       (windows amd64)
+├── internal
+│   ├── api          (openai.go, commandcode.go — wire types)
+│   ├── proxy        (proxy.go, convert.go, model.go, catalog.go,
+│   │                 identity.go, envconfig.go, beacon.go, clitools.json)
+│   ├── upstream     (transport.go, spec.go, node24_clienthello.bin)
+│   ├── server       (server.go)
+│   ├── update       (update.go — GitHub tag self-update notice)
+│   └── version      (version.go — pinned CLI version baseline)
+└── tools
+    ├── tap          (transparent TLS capture probe)
+    └── recapture.mjs (regenerate baselines from a capture)
 ```
 
 ## How it works
 
-1. Client sends an OpenAI-compatible request to the local proxy.
-2. The proxy extracts system messages, maps the model name, and converts messages to CommandCode format.
-3. The proxy sends the request to `https://api.commandcode.ai/alpha/generate`.
-4. CommandCode streaming NDJSON events are converted back to OpenAI-compatible SSE chunks or collected into a single JSON response.
+1. On first use with a key, the proxy replays the real CLI's startup sequence upstream (whoami → lifecycle-events → fingerprint/record) before forwarding any chat traffic, so every session has its birth events.
+2. Client sends an OpenAI-compatible request to the local proxy.
+3. The proxy extracts system messages, maps the model name, converts messages to CommandCode format, and fills the identity fields (`threadId`/`x-session-id`, `x-project-slug`, `config` snapshot) exactly like the CLI does; when the client sends no tools, the CLI's built-in tool set is injected.
+4. The request goes to `https://api.commandcode.ai/alpha/generate` over a hand-rolled transport that replays the captured Node/OpenSSL TLS ClientHello (JA3/JA4) and emits HTTP/1.1 headers in the CLI's wire order.
+5. CommandCode streaming NDJSON events are converted back to OpenAI-compatible SSE chunks (always terminated with `finish_reason` + `[DONE]`) or collected into a single JSON response; upstream errors surface as HTTP errors, never as fake successes.
 
 ## Version check
 
@@ -246,36 +245,30 @@ If the latest GitHub tag is newer than the current app version, the version line
 v1.1.0 (latest: v1.x.x)
 ```
 
-## CommandCode version header
+## Impersonated CLI version
 
-The upstream request includes:
+Upstream requests carry:
 
 ```http
-x-command-code-version: <latest npm command-code version>
+x-command-code-version: 1.50.1
 ```
 
-The value is fetched from:
+The value is **pinned** to `internal/version.Baseline` — the command-code version whose TLS handshake, header templates and tool set were captured and are replayed by this proxy. It is deliberately not looked up from npm at runtime: a live "latest" version header sitting on top of frozen 1.50.1 behaviour is a contradiction the server can cross-check, and the old runtime lookup also sat on the first request's path without a timeout. Bump the baseline together with a re-capture (next section).
 
-```text
-https://registry.npmjs.org/command-code/latest
-```
+## Re-capturing the fingerprint baseline (template-aging maintenance)
 
-The fetched version is cached for 30 minutes. If the registry request fails, the proxy uses the last cached version, or `unknown` if no version has been fetched yet.
+The TLS handshake fingerprint (`internal/upstream/node24_clienthello.bin`), the CLI built-in tool definitions (`internal/proxy/clitools.json`) and the device fingerprint report body (`fingerprint.json`, not committed) all come from one capture of the real CLI. The CLI auto-updates; once its bundled Node/OpenSSL changes, the baselines age and must be re-captured:
 
-## 重捕获指纹基准（模板老化维护）
-
-本代理的 TLS 握手指纹（`internal/upstream/node24_clienthello.bin`）、CLI 内置工具定义（`internal/proxy/clitools.json`）与设备指纹上报体（`fingerprint.json`，不入库）都来自真实 CLI 的一次捕获。CLI 会自动更新，捆绑的 Node/OpenSSL 版本变化后基准会老化，此时按下列步骤重捕：
-
-1. 解析真实上游 IP（供探针转发用，避免 hosts 回环）：
-   `nslookup api.commandcode.ai` → 记下任一 IPv4（如 `172.67.167.23`）。
-2. 以管理员在 `C:\Windows\System32\drivers\etc\hosts` 末尾添加：
+1. Resolve the real upstream IP (for the probe to forward to, avoiding a hosts loop):
+   `nslookup api.commandcode.ai` → note any IPv4 (e.g. `172.67.167.23`).
+2. As administrator, append to `C:\Windows\System32\drivers\etc\hosts`:
    `127.0.0.1 api.commandcode.ai`
-3. 启动转发探针（会透明转发到真实上游，会话正常进行）：
+3. Start the forwarding probe (transparently relays to the real upstream; the session proceeds normally):
    `go run ./tools/tap -listen 127.0.0.1:443 -upstream <IP>:443 -out capture.jsonl`
-4. 跑一次真 CLI 直到发出 generate 请求（会产生一次真实对话，消耗少量额度）：
+4. Run the real CLI once until it issues a generate request (this creates one real conversation, consuming a little quota):
    `set NODE_TLS_REJECT_UNAUTHORIZED=0 && command-code -p "Reply with exactly: OK" --no-session --skip-onboarding -m deepseek/deepseek-v4-flash`
-5. **立刻删除 hosts 里的重定向行并停掉探针。**
-6. 一键回灌三份基准数据：
+5. **Immediately remove the hosts redirect line and stop the probe.**
+6. Regenerate all three baselines in one step:
    `node tools/recapture.mjs capture.jsonl`
-7. 脚本末尾会打印捕获到的 `cliVersion`。若与 `internal/version/version.go` 的 `Baseline` 常量不同，**必须同步修改**：`x-command-code-version` 报的版本要与 TLS/头/工具所回放的行为版本一致，否则"新版 CLI 却发旧版行为"会被服务端交叉验证出来。版本不再从 npm 动态拉取，就是这个原因。
-8. 重跑 `go test ./...`（测试会将传输层握手与该基准逐字段比对），然后重新构建二进制。
+7. The script prints the captured `cliVersion` at the end. If it differs from `Baseline` in `internal/version/version.go`, **update it together**: the `x-command-code-version` header must match the behaviour version being replayed, otherwise "a new CLI sending old behaviour" becomes cross-checkable server-side.
+8. Re-run `go test ./...` (the transport test field-compares the handshake against the new baseline), then rebuild all three binaries.
