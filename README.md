@@ -217,7 +217,7 @@ Unknown model names are passed through unchanged.
 │   ├── upstream     (transport.go, spec.go, node24_clienthello.bin)
 │   ├── server       (server.go)
 │   ├── update       (update.go — GitHub tag self-update notice)
-│   └── version      (version.go — pinned CLI version baseline)
+│   └── version      (version.go — npm-resolved CLI version, frozen per process)
 └── tools
     ├── tap          (transparent TLS capture probe)
     └── recapture.mjs (regenerate baselines from a capture)
@@ -247,13 +247,24 @@ v1.1.0 (latest: v1.x.x)
 
 ## Impersonated CLI version
 
-Upstream requests carry:
+Upstream requests carry an `x-command-code-version` header (e.g. `1.53.0`), tracking the latest published CLI.
 
-```http
-x-command-code-version: 1.50.1
-```
+The value is **resolved once at process start** from npm (`command-code`'s
+`latest`) and then **frozen for the whole process**. This mirrors the real
+CLI, which force-updates itself at launch and then reports one exact version
+consistently in its lifecycle beacon and every header — a version that changed
+mid-run would contradict the `cliVersion` already sent in this process's
+lifecycle-events beacon, the one cross-check a server can reliably make. The
+lookup is bounded by a 5s timeout and does NOT sit on any request path (it
+runs before serving), so a stalled registry can never hang a chat request —
+unlike the old design that did a synchronous no-timeout `http.Get` on the
+first request.
 
-The value is **pinned** to `internal/version.Baseline` — the command-code version whose TLS handshake, header templates and tool set were captured and are replayed by this proxy. It is deliberately not looked up from npm at runtime: a live "latest" version header sitting on top of frozen 1.50.1 behaviour is a contradiction the server can cross-check, and the old runtime lookup also sat on the first request's path without a timeout. Bump the baseline together with a re-capture (next section).
+If the lookup fails (offline, blocked, malformed answer), the version falls
+back to `internal/version.Baseline` — the command-code version whose TLS
+handshake, header templates and tool set this proxy actually replays. Restart
+the proxy to re-resolve; bump `Baseline` after a re-capture so the offline
+fallback stays current.
 
 ## Re-capturing the fingerprint baseline (template-aging maintenance)
 
@@ -270,5 +281,5 @@ The TLS handshake fingerprint (`internal/upstream/node24_clienthello.bin`), the 
 5. **Immediately remove the hosts redirect line and stop the probe.**
 6. Regenerate all three baselines in one step:
    `node tools/recapture.mjs capture.jsonl`
-7. The script prints the captured `cliVersion` at the end. If it differs from `Baseline` in `internal/version/version.go`, **update it together**: the `x-command-code-version` header must match the behaviour version being replayed, otherwise "a new CLI sending old behaviour" becomes cross-checkable server-side.
+7. The script prints the captured `cliVersion` at the end. The live `x-command-code-version` header is resolved from npm at startup, but update `Baseline` in `internal/version/version.go` to this version as well: it is the offline fallback and the reference for the replayed behaviour, so it should not lag the new capture.
 8. Re-run `go test ./...` (the transport test field-compares the handshake against the new baseline), then rebuild all three binaries.

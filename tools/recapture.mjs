@@ -67,5 +67,5 @@ const verLine = heads.find((h) => h.toLowerCase().startsWith("x-command-code-ver
 const ver = verLine ? verLine.split(":")[1].trim() : "(缺失)";
 console.log(
   `\n捕获 cliVersion: ${ver}\n` +
-  `>>> 若与 internal/version/version.go 的 Baseline 不同，请同步修改 Baseline 常量 <<<`
+  `>>> 线上版本头启动时从 npm 动态解析; 此处请把 internal/version/version.go 的 Baseline (离线回退值) 同步更新为此版本 <<<`
 );

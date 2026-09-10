@@ -217,7 +217,7 @@ https://commandcode.ai/docs/reference/cli/models
 │   ├── upstream     (transport.go, spec.go, node24_clienthello.bin)
 │   ├── server       (server.go)
 │   ├── update       (update.go — GitHub tag 新版本提示)
-│   └── version      (version.go — 钉死的 CLI 版本基线)
+│   └── version      (version.go — 启动时解析 npm 最新、整进程冻结的 CLI 版本)
 └── tools
     ├── tap          (透明 TLS 捕获探针)
     └── recapture.mjs (从捕获文件再生成基准)
@@ -247,13 +247,11 @@ v1.1.0 (latest: v1.x.x)
 
 ## 模拟的 CLI 版本
 
-上游请求携带：
+上游请求携带 `x-command-code-version` 头（如 `1.53.0`），取值随 npm 上的最新 CLI 而定。
 
-```http
-x-command-code-version: 1.50.1
-```
+该值**在进程启动时从 npm 解析一次**（`command-code` 包的 `latest`），随后**整进程冻结**。这是对真实 CLI 的镜像：CLI 在启动时强制自更新，之后在其生命周期信标与每个请求头里都上报同一个精确版本——版本若中途改变，会与本进程 lifecycle-events 信标已发出的 `cliVersion` 自相矛盾，而这正是服务端能可靠交叉验证的一处。解析受 5 秒超时约束，且**不挂在任何请求路径上**（在开始服务前完成），因此注册表卡死绝不会吊死某个对话请求——不像旧设计那样在首个请求上做无超时的同步 `http.Get`。
 
-该值**钉死**为 `internal/version.Baseline`——即本代理所回放行为（TLS 握手、头模板、工具集）对应的 command-code 版本。刻意不再运行时查 npm：冻结的 1.50.1 行为配一个实时的 "latest" 版本头，是服务端可交叉验证的矛盾；旧的运行时查找还无超时地挂在首个请求路径上。重新捕获基准时（下节）一并更新此常量。
+若解析失败（离线、被封、返回畸形），版本回退到 `internal/version.Baseline`——即本代理实际回放其 TLS 握手、头模板与工具集的那个 command-code 版本。重启代理即重新解析；每次重捕获基准后同步更新 `Baseline`，让离线回退不过时。
 
 ## 重捕获指纹基准（模板老化维护）
 
@@ -270,5 +268,5 @@ x-command-code-version: 1.50.1
 5. **立刻删除 hosts 里的重定向行并停掉探针。**
 6. 一键回灌三份基准数据：
    `node tools/recapture.mjs capture.jsonl`
-7. 脚本末尾会打印捕获到的 `cliVersion`。若与 `internal/version/version.go` 的 `Baseline` 常量不同，**必须同步修改**：`x-command-code-version` 报的版本要与 TLS/头/工具所回放的行为版本一致，否则"新版 CLI 却发旧版行为"会被服务端交叉验证出来。
+7. 脚本末尾会打印捕获到的 `cliVersion`。线上 `x-command-code-version` 头是启动时从 npm 解析的，但也要把 `internal/version/version.go` 的 `Baseline` 更新为该版本：它是离线回退值、也是所回放行为的参照，不应落后于新捕获的基准。
 8. 重跑 `go test ./...`（测试会将传输层握手与该基准逐字段比对），然后重新构建三个二进制。

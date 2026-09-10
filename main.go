@@ -8,6 +8,7 @@ import (
 	"github.com/dev2k6/command-code-proxy-server/internal/proxy"
 	"github.com/dev2k6/command-code-proxy-server/internal/server"
 	"github.com/dev2k6/command-code-proxy-server/internal/update"
+	"github.com/dev2k6/command-code-proxy-server/internal/version"
 )
 
 const appVersion = "v1.1.0"
@@ -42,6 +43,11 @@ func main() {
 		proxy.SetProjectSlug(*projectSlug)
 	}
 	proxy.Debug = debugLogging
+	// 启动时解析一次 npm latest 并冻结整进程（真实 CLI 即进程启动自更新、
+	// 进程内版本恒定；信标与后续请求必须报同一个版本）。≤5s 超时，失败留
+	// Baseline，重启即刷新。必须早于 StartBeacon：lifecycle 的 cliVersion 与
+	// 头里的 x-command-code-version 由此同源。
+	version.Resolve()
 	// StartBeacon 之后再不得替换 identity/envCfg：runBeacon 无锁读取
 	// processSess，setter 整体替换指针，先改完再信标。
 	proxy.StartBeacon(key)      // 启动时按真 CLI 的上报序列注册会话与设备指纹
@@ -71,6 +77,7 @@ func printStartupInfo(srv *server.Server) {
 	fmt.Println("========================================")
 	fmt.Println("")
 	fmt.Printf("  版本:        %s\n", versionText())
+	fmt.Printf("  CLI 模拟:    %s\n", version.GetCommandCodeVersion())
 	fmt.Printf("  项目地址:    %s\n", repositoryURL)
 	fmt.Printf("  绑定地址:    %s\n", srv.GetHost())
 	fmt.Printf("  端口:        %s\n", srv.GetPort())
