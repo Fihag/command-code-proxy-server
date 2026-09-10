@@ -122,6 +122,11 @@ func collectEnvConfig() api.CCConfig {
 		WorkingDir:  cwd,
 		Environment: nodePlatform(),
 		Structure:   topLevels(cwd),
+		// The CLI's buildServerConfig always sends recentCommits as an array
+		// (empty off-repo, `git log --oneline -3` split otherwise) — never
+		// null. A nil slice here would serialize to "recentCommits":null and
+		// the upstream schema rejects it with 400 at config.recentCommits.
+		RecentCommits: []string{},
 	}
 	if collectGit(cwd, "rev-parse", "--git-dir") == "" {
 		return cfg // IsGitRepo false, empty branch/status — same as CLI
