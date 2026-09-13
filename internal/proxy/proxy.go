@@ -345,14 +345,26 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 
 	if openAIReq.Stream {
-		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created)
+		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created, wantsUsage(openAIReq.StreamOptions))
 	} else {
 		p.NonStreamResponse(w, ccResp, requestID, ccBody.Params.Model, created)
 	}
 }
 
+// wantsUsage reports whether the client asked for a terminal usage chunk via
+// stream_options.include_usage (OpenAI semantics). ZCode relies on that chunk
+// to display context usage.
+func wantsUsage(opts any) bool {
+	m, ok := opts.(map[string]any)
+	if !ok {
+		return false
+	}
+	b, _ := m["include_usage"].(bool)
+	return b
+}
+
 // StreamResponse handles streaming response from CommandCode to OpenAI SSE
-func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64) {
+func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
@@ -371,6 +383,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	toolCallIndexes := map[string]int{}
 	finishSent := false
 	sawToolCalls := false
+	var usageIn, usageOut int
 
 	for scanner.Scan() {
 		select {
@@ -391,6 +404,28 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		}
 
 		switch event.Type {
+		case "reasoning-delta":
+			// Upstream streams the model's thinking as reasoning-* events
+			// (AI SDK v5 wire form). Clients expect it as reasoning_content on
+			// the delta; the surrounding reasoning-start/-end carry no payload
+			// and are handled below.
+			delta := api.OpenAIDelta{ReasoningContent: event.Text}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "reasoning-start", "reasoning-end":
+			// No OpenAI equivalent: the reasoning text rides on the deltas and
+			// clients bracket it themselves.
+
 		case "text-delta":
 			delta := api.OpenAIDelta{Content: event.Text}
 			if !sentRole {
@@ -528,6 +563,10 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			})
 
 		case "finish":
+			if event.TotalUsage != nil {
+				usageIn = event.TotalUsage.InputTokens
+				usageOut = event.TotalUsage.OutputTokens
+			}
 			reason := normalizeFinishReason(event.FinishReason)
 			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
 				ID:      requestID,
@@ -540,6 +579,23 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 					FinishReason: &reason,
 				}},
 			})
+			// stream_options.include_usage: a terminal chunk with empty
+			// choices carrying token counts, required before [DONE]. Without
+			// it clients like ZCode cannot show context usage.
+			if includeUsage {
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{},
+					Usage: &api.OpenAIUsage{
+						PromptTokens:     usageIn,
+						CompletionTokens: usageOut,
+						TotalTokens:      usageIn + usageOut,
+					},
+				})
+			}
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			finishSent = true
@@ -558,6 +614,12 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			})
 			fmt.Fprintf(w, "data: %s\n\n", frame)
 			flusher.Flush()
+
+		default:
+			// Unknown upstream event: log once and keep going rather than
+			// silently dropping future protocol additions (they used to fall
+			// out of this switch unnoticed).
+			log.Printf("[警告] 未处理的上游事件类型: %q (shape: type=%s)", event.Type, event.Type)
 		}
 	}
 
@@ -603,6 +665,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var content strings.Builder
+	var reasoning strings.Builder
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
@@ -623,6 +686,9 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		}
 
 		switch event.Type {
+		case "reasoning-delta":
+			reasoning.WriteString(event.Text)
+		case "reasoning-start", "reasoning-end":
 		case "text-delta":
 			content.WriteString(event.Text)
 		case "tool-use":
@@ -713,8 +779,9 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	}
 
 	msg := &api.OpenAIMessage{
-		Role:    "assistant",
-		Content: content.String(),
+		Role:             "assistant",
+		Content:          content.String(),
+		ReasoningContent: reasoning.String(),
 	}
 	finishReason := "stop"
 	if hasToolCalls {

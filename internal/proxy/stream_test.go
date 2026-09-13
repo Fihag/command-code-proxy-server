@@ -20,9 +20,14 @@ func upResp(body string) *http.Response {
 
 func streamToDone(t *testing.T, p *Proxy, upstream string) string {
 	t.Helper()
+	return streamToDoneUsage(t, p, upstream, false)
+}
+
+func streamToDoneUsage(t *testing.T, p *Proxy, upstream string, includeUsage bool) string {
+	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
-	p.StreamResponse(w, r, upResp(upstream), "chatcmpl-test", "deepseek/deepseek-v4-flash", 1)
+	p.StreamResponse(w, r, upResp(upstream), "chatcmpl-test", "deepseek/deepseek-v4-flash", 1, includeUsage)
 	return w.Body.String()
 }
 
@@ -68,6 +73,72 @@ func TestStreamToolUseThenAggregatedCallNoDuplicate(t *testing.T) {
 	}
 	if !strings.Contains(got, `"finish_reason":"tool_calls"`) {
 		t.Errorf("stream with tool calls must finish with tool_calls:\n%s", got)
+	}
+}
+
+// reasoning-delta events (the CLI's wire form for model thinking) must reach
+// the client as reasoning_content deltas; start/end carry no payload and must
+// not emit chunks.
+func TestStreamReasoningBecomesReasoningContent(t *testing.T) {
+	p := NewProxy("k")
+	got := streamToDone(t, p,
+		`{"type":"reasoning-start","id":"reasoning-0"}`+"\n"+
+			`{"type":"reasoning-delta","id":"reasoning-0","text":"想"}`+"\n"+
+			`{"type":"reasoning-delta","id":"reasoning-0","text":"一下"}`+"\n"+
+			`{"type":"reasoning-end","id":"reasoning-0"}`+"\n"+
+			`{"type":"text-delta","text":"答案"}`+"\n"+
+			`{"type":"finish","finishReason":"stop"}`)
+	if !strings.Contains(got, `"reasoning_content":"想"`) || !strings.Contains(got, `"reasoning_content":"一下"`) {
+		t.Errorf("reasoning deltas must be forwarded as reasoning_content:\n%s", got)
+	}
+	if strings.Contains(got, `"reasoning_content":""`) {
+		t.Errorf("reasoning-start/end must not emit empty chunks:\n%s", got)
+	}
+	if strings.Contains(got, `"content":"想"`) {
+		t.Errorf("reasoning must not leak into content:\n%s", got)
+	}
+	if !strings.Contains(got, `"content":"答案"`) {
+		t.Errorf("text delta must still be content:\n%s", got)
+	}
+}
+
+// stream_options.include_usage must produce the terminal usage chunk (empty
+// choices, token counts) before [DONE]; without the flag there must be none.
+func TestStreamUsageChunkHonorsIncludeUsage(t *testing.T) {
+	upstream := `{"type":"text-delta","text":"hi"}` + "\n" +
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":15410,"outputTokens":12}}`
+	p := NewProxy("k")
+
+	with := streamToDoneUsage(t, p, upstream, true)
+	if !strings.Contains(with, `"prompt_tokens":15410`) || !strings.Contains(with, `"total_tokens":15422`) {
+		t.Errorf("include_usage must emit terminal usage chunk:\n%s", with)
+	}
+	usageChunks := strings.Count(with, `"choices":[]`)
+	if usageChunks != 1 {
+		t.Errorf("want exactly 1 empty-choices usage chunk, got %d:\n%s", usageChunks, with)
+	}
+
+	without := streamToDoneUsage(t, p, upstream, false)
+	if strings.Contains(without, `"choices":[]`) {
+		t.Errorf("usage chunk must be omitted without include_usage:\n%s", without)
+	}
+}
+
+// Non-stream: reasoning accumulates into message.reasoning_content.
+func TestNonStreamReasoningCollected(t *testing.T) {
+	p := NewProxy("k")
+	w := httptest.NewRecorder()
+	p.NonStreamResponse(w, upResp(
+		`{"type":"reasoning-delta","text":"思考"}`+"\n"+
+			`{"type":"text-delta","text":"答案"}`+"\n"+
+			`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":5,"outputTokens":2}}`),
+		"chatcmpl-test", "m", 1)
+	got := w.Body.String()
+	if !strings.Contains(got, `"reasoning_content":"思考"`) {
+		t.Errorf("non-stream reasoning_content missing: %s", got)
+	}
+	if !strings.Contains(got, `"content":"答案"`) {
+		t.Errorf("content wrong: %s", got)
 	}
 }
 

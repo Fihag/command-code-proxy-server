@@ -10,6 +10,10 @@ type OpenAIMessage struct {
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 	Refusal    string        `json:"refusal,omitempty"`
 	Audio      *MessageAudio `json:"audio,omitempty"`
+	// ReasoningContent carries the model's thinking for clients that render a
+	// separate reasoning panel. Upstream CommandCode reports it as
+	// reasoning-delta events on the wire.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type ContentPart struct {
@@ -90,6 +94,9 @@ type OpenAIDelta struct {
 	Content   string                `json:"content,omitempty"`
 	ToolCalls []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
 	Refusal   string                `json:"refusal,omitempty"`
+	// ReasoningContent is the streaming counterpart of OpenAIMessage's field;
+	// clients read reasoning_content first and fall back to reasoning.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type OpenAIDeltaToolCall struct {
