@@ -6,7 +6,7 @@
 
 仓库：https://github.com/dev2k6/command-code-proxy-server
 
-版本：`v1.1.0`
+版本：`v1.1.1`
 
 ## 功能特性
 
@@ -242,7 +242,7 @@ https://api.github.com/repos/dev2k6/command-code-proxy-server/tags
 若最新 GitHub tag 比当前版本新，版本行显示为：
 
 ```text
-v1.1.0 (latest: v1.x.x)
+v1.1.1 (latest: v1.x.x)
 ```
 
 ## 模拟的 CLI 版本
