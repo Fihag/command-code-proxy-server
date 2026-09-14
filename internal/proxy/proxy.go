@@ -634,6 +634,13 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			fmt.Fprintf(w, "data: %s\n\n", frame)
 			flusher.Flush()
 
+		// AI SDK v5 framing events: lifecycle/segment boundaries and provider
+		// metadata. They carry no payload the OpenAI wire format needs — the
+		// content arrives via text-delta / tool-* / finish — so they are
+		// skipped explicitly instead of tripping the unknown-event warning.
+		case "start", "start-step", "finish-step",
+			"text-start", "text-end", "tool-input-end", "provider-metadata":
+
 		default:
 			// Unknown upstream event: log once and keep going rather than
 			// silently dropping future protocol additions (they used to fall
@@ -775,6 +782,8 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 				inputTokens = event.TotalUsage.InputTokens
 				outputTokens = event.TotalUsage.OutputTokens
 			}
+		case "start", "start-step", "finish-step",
+			"text-start", "text-end", "tool-input-end", "provider-metadata":
 		case "error":
 			log.Printf("[错误] 流式响应出错: %v", event.Error)
 			if upstreamErrMsg == "" {
