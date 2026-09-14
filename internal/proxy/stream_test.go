@@ -171,3 +171,23 @@ func TestNonStreamNormalStillSucceeds(t *testing.T) {
 		t.Errorf("normal non-stream body wrong: %s", got)
 	}
 }
+
+// A single NDJSON event larger than any Scanner token cap must still be
+// delivered in full: upstream legitimately puts a whole large tool-call input
+// on one line, and bufio.Scanner would abort the stream with ErrTooLong.
+func TestStreamVeryLongSingleLine(t *testing.T) {
+	p := NewProxy("k")
+	huge := strings.Repeat("x", 2*1024*1024)
+	got := streamToDone(t, p, `{"type":"text-delta","text":"`+huge+`"}`)
+	if !strings.Contains(got, huge) {
+		t.Fatalf("2MB delta truncated or dropped (stream body %d bytes)", len(got))
+	}
+	w := httptest.NewRecorder()
+	p.NonStreamResponse(w, upResp(
+		`{"type":"text-delta","text":"`+huge+`"}`+"\n"+
+			`{"type":"finish","finishReason":"stop"}`),
+		"chatcmpl-test", "m", 1)
+	if !strings.Contains(w.Body.String(), huge) {
+		t.Fatalf("2MB content missing from non-stream body (%d bytes)", w.Body.Len())
+	}
+}

@@ -363,6 +363,19 @@ func wantsUsage(opts any) bool {
 	return b
 }
 
+// nextStreamLine reads one upstream NDJSON line without a length cap.
+// bufio.Scanner aborts the entire stream with ErrTooLong once a single event
+// exceeds its max token size (even at 1MB), and upstream legitimately sends
+// such lines — e.g. a tool-call event whose input carries a whole large file.
+// A final line lacking its trailing newline is still delivered before EOF.
+func nextStreamLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if line != "" {
+		return strings.TrimRight(line, "\r\n"), nil
+	}
+	return "", err
+}
+
 // StreamResponse handles streaming response from CommandCode to OpenAI SSE
 func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
@@ -376,8 +389,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	reader := bufio.NewReader(ccResp.Body)
 	sentRole := false
 	toolCallIndex := 0
 	toolCallIndexes := map[string]int{}
@@ -385,14 +397,21 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	sawToolCalls := false
 	var usageIn, usageOut int
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-r.Context().Done():
 			return
 		default:
 		}
 
-		line := strings.TrimSpace(scanner.Text())
+		raw, err := nextStreamLine(reader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[错误] 流读取失败: %v", err)
+			}
+			break
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
@@ -623,10 +642,6 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		}
 	}
 
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		log.Printf("[错误] 流读取失败: %v", err)
-	}
-
 	// Upstream ended without a finish event (connection dropped mid-stream,
 	// or the server closed right after an error event): a stream that never
 	// says [DONE] leaves well-behaved OpenAI clients hanging on read. Close
@@ -661,8 +676,7 @@ func (p *Proxy) WriteSSE(w io.Writer, flusher http.Flusher, resp api.OpenAIChatR
 
 // NonStreamResponse handles non-streaming response
 func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64) {
-	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	reader := bufio.NewReader(ccResp.Body)
 
 	var content strings.Builder
 	var reasoning strings.Builder
@@ -673,8 +687,15 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	toolCallByID := map[string]int{}
 	toolInputBuffers := map[string]*strings.Builder{}
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for {
+		raw, err := nextStreamLine(reader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[错误] 流读取失败: %v", err)
+			}
+			break
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
@@ -764,10 +785,6 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 				}
 			}
 		}
-	}
-
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		log.Printf("[错误] 流读取失败: %v", err)
 	}
 
 	// An upstream error must never be answered with an HTTP 200 holding an
