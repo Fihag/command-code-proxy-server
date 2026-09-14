@@ -68,13 +68,28 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 				})
 				addedTools[tc.ID] = true
 			}
-			ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: contentParts})
+			ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: normalizeContent(contentParts)})
 			continue
 		}
 
-		ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: parseContent(m.Content, toolNames)})
+		ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: normalizeContent(parseContent(m.Content, toolNames))})
 	}
 	return ccMsgs
+}
+
+// normalizeContent substitutes a single empty text part for content that
+// parsed to nothing. Upstream only accepts null content on tool results; an
+// assistant/user message with null or empty content (e.g. a reasoning-only
+// assistant turn replayed by the client) otherwise serializes as
+// `"content":null` and is rejected with a 400.
+func normalizeContent(parts []api.CCContentPart) []api.CCContentPart {
+	if len(parts) == 0 {
+		// Explicit pointer: strPtr("") would return nil and drop the text field,
+		// which upstream's text-part schema also requires.
+		empty := ""
+		return []api.CCContentPart{{Type: "text", Text: &empty}}
+	}
+	return parts
 }
 
 // ConvertTools maps OpenAI function tools onto the CLI's wire tool objects
