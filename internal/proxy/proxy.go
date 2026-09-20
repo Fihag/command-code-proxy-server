@@ -334,10 +334,41 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// has run, then forward.
 	p.awaitBeacon(r.Context())
 
-	// Call upstream
-	ccResp, err := p.CallUpstream(ccReq)
-	if err != nil {
-		p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
+	// Call upstream. The vendor's 5xx (typically an empty-message
+	// INTERNAL_SERVER_ERROR from a backend hiccup) is treated as transient:
+	// the request is rebuilt and retried with linear backoff. Each attempt
+	// re-reads the body, so a stale request object can't be replayed.
+	const maxAttempts = 3
+	var ccResp *http.Response
+	var callErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		attemptReq := ccReq
+		if attempt > 0 {
+			var berr error
+			attemptReq, berr = p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
+			if berr != nil {
+				p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				if ccResp != nil {
+					ccResp.Body.Close()
+				}
+				return
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+		ccResp, callErr = p.CallUpstream(attemptReq)
+		if callErr == nil && ccResp.StatusCode >= 500 && attempt < maxAttempts-1 {
+			log.Printf("[警告] 上游返回 %d, 重试 %d/%d", ccResp.StatusCode, attempt+1, maxAttempts)
+			ccResp.Body.Close()
+			continue
+		}
+		break
+	}
+	if callErr != nil {
+		p.writeOpenAIError(w, http.StatusBadGateway, callErr.Error(), "api_error")
 		return
 	}
 	defer ccResp.Body.Close()
