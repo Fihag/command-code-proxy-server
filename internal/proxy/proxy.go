@@ -24,6 +24,10 @@ const defaultBaseURL = "https://api.commandcode.ai"
 const defaultTimeout = 300 * time.Second
 const debugLogLimit = 20000
 
+// maxUpstreamTokens is the hard ceiling the CommandCode API validates
+// params.max_tokens against ("Too big: expected number to be <=200000").
+const maxUpstreamTokens = 200000
+
 // fingerprintFile is the local (gitignored) device fingerprint reported to
 // /alpha/fingerprint/record at startup — the real CLI uploads it per process.
 // Produced by tools/recapture.mjs from a tap capture; absence disables only
@@ -178,6 +182,15 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	}
 	if openAIReq.MaxCompletionTokens != nil {
 		maxTokens = *openAIReq.MaxCompletionTokens
+	}
+	// Upstream hard-caps params.max_tokens at 200k and answers 400 "Too big"
+	// above it; clients routinely ask for larger windows, so clamp to the
+	// ceiling (and drop non-positive values back to the default).
+	if maxTokens < 1 {
+		maxTokens = 64000
+	}
+	if maxTokens > maxUpstreamTokens {
+		maxTokens = maxUpstreamTokens
 	}
 
 	// The CLI always ships its built-in tool set in every generate call.

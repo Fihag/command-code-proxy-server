@@ -208,3 +208,36 @@ func TestSessionStableWithoutUserField(t *testing.T) {
 		t.Errorf("multi-turn replay must keep thread: %q vs %q", a.ThreadID, b.ThreadID)
 	}
 }
+
+// Upstream validates params.max_tokens <= 200000 and 400s above it; the
+// converter must clamp instead of passing a client's larger window through.
+func TestBuildRequestClampsMaxTokens(t *testing.T) {
+	p := NewProxy("k")
+	base := func() api.OpenAIChatRequest {
+		return api.OpenAIChatRequest{
+			Model:    "deepseek/deepseek-v4-flash",
+			Messages: []api.OpenAIMessage{{Role: "user", Content: "hi"}},
+		}
+	}
+	cases := []struct {
+		name string
+		req  api.OpenAIChatRequest
+		want int
+	}{
+		{"over ceiling", func() api.OpenAIChatRequest { r := base(); v := 256000; r.MaxTokens = &v; return r }(), maxUpstreamTokens},
+		{"max_completion_tokens over ceiling", func() api.OpenAIChatRequest { r := base(); v := 400000; r.MaxCompletionTokens = &v; return r }(), maxUpstreamTokens},
+		{"zero falls back to default", func() api.OpenAIChatRequest { r := base(); v := 0; r.MaxTokens = &v; return r }(), 64000},
+		{"under ceiling untouched", func() api.OpenAIChatRequest { r := base(); v := 128000; r.MaxTokens = &v; return r }(), 128000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := p.BuildRequest(tc.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := body.Params.MaxTokens; got != tc.want {
+				t.Errorf("max_tokens = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
