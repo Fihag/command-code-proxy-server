@@ -500,3 +500,31 @@ func TestResponseDecompression(t *testing.T) {
 		})
 	}
 }
+
+func TestTraceparentConversationScoped(t *testing.T) {
+	// command-code >= 1.55.1 nests chat spans under a per-conversation
+	// context: the trace id is stable within a conversation while the span
+	// id stays per-request. Pre-1.55 (no session) both are per-request.
+	tp1 := newTraceparentFor("5178a72b-04a7-497d-8639-8c87974f3288")
+	tp2 := newTraceparentFor("5178a72b-04a7-497d-8639-8c87974f3288")
+	other := newTraceparentFor("7eb40ea8-8afc-46dd-b1e6-f89445f0ae34")
+	for _, tp := range []string{tp1, tp2, other} {
+		parts := strings.Split(tp, "-")
+		if len(parts) != 4 || parts[0] != "00" || parts[3] != "01" || len(parts[1]) != 32 || len(parts[2]) != 16 {
+			t.Fatalf("malformed traceparent: %q", tp)
+		}
+	}
+	if strings.Split(tp1, "-")[1] != strings.Split(tp2, "-")[1] {
+		t.Errorf("same conversation must share trace id: %q vs %q", tp1, tp2)
+	}
+	if strings.Split(tp1, "-")[2] == strings.Split(tp2, "-")[2] {
+		t.Errorf("span id must differ per request: %q", tp1)
+	}
+	if strings.Split(tp1, "-")[1] == strings.Split(other, "-")[1] {
+		t.Errorf("different conversations must not share trace id")
+	}
+	r1, r2 := newTraceparentFor(""), newTraceparentFor("")
+	if strings.Split(r1, "-")[1] == strings.Split(r2, "-")[1] {
+		t.Errorf("sessionless traceparent must stay per-request random")
+	}
+}

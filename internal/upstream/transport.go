@@ -7,6 +7,7 @@ import (
 	"compress/zlib"
 	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -244,7 +245,7 @@ func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 		wireIf("x-taste-learning", "X-Taste-Learning")
 		wireIf("x-session-id", "X-Session-Id")
 		wireIf("Authorization", "Authorization")
-		wire("traceparent", newTraceparent())
+		wire("traceparent", newTraceparentFor(h.Get("X-Session-Id")))
 	default: // lifecycle / fingerprint / whoami share one shape family
 		if req.URL.Path == "/alpha/fingerprint/record" {
 			if ct != "" {
@@ -285,14 +286,28 @@ func writeRequest(w io.Writer, req *http.Request, body []byte) error {
 	return nil
 }
 
-// newTraceparent emits a W3C trace context header the CLI's chat span
-// generator produces: "00-<32 hex trace id>-<16 hex span id>-01".
-func newTraceparent() string {
+// newTraceparentFor emits the W3C trace context header of a CLI chat span:
+// "00-<32 hex trace id>-<16 hex span id>-01". Since command-code 1.55.1 the
+// chat span nests under a per-conversation telemetry context, so the trace id
+// is stable across every request of one conversation while the span id stays
+// per-request. conversation is the x-session-id/threadId; with no session the
+// old (pre-1.55) shape applies: a fresh random trace id per request.
+func newTraceparentFor(conversation string) string {
 	var t [16]byte
-	var s [8]byte
-	if _, err := crand.Read(t[:]); err != nil {
-		panic(err)
+	if conversation == "" {
+		if _, err := crand.Read(t[:]); err != nil {
+			panic(err)
+		}
+	} else {
+		sum := sha256.Sum256([]byte(conversation))
+		copy(t[:], sum[:16])
+		if t == [16]byte{} { // W3C rejects an all-zero trace id
+			if _, err := crand.Read(t[:]); err != nil {
+				panic(err)
+			}
+		}
 	}
+	var s [8]byte
 	if _, err := crand.Read(s[:]); err != nil {
 		panic(err)
 	}
