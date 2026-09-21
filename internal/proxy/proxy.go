@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,41 @@ const debugLogLimit = 20000
 // maxUpstreamTokens is the hard ceiling the CommandCode API validates
 // params.max_tokens against ("Too big: expected number to be <=200000").
 const maxUpstreamTokens = 200000
+
+// Upstream reports two throttling conditions, and clients must tell them
+// apart: a transient per-minute rate limit ("Rate limit exceeded ... Retry
+// after Ns.") that waiting clears, and a hard quota/billing exhaustion
+// ("exceeded your current quota ...") that waiting does NOT clear. Both are
+// surfaced as 429 with OpenAI-style error types so well-behaved clients back
+// off instead of hammering the limit — a blind 502 invites ZCode to retry the
+// failed turn immediately, deepening the very congestion it hit.
+var retryAfterRe = regexp.MustCompile(`Retry after (\d+)s`)
+
+func upstreamRateLimitRetryAfter(msg string) string {
+	if !strings.Contains(msg, "Rate limit exceeded") {
+		return ""
+	}
+	if m := retryAfterRe.FindStringSubmatch(msg); m != nil {
+		return m[1]
+	}
+	return "60"
+}
+
+func upstreamQuotaExceeded(msg string) bool {
+	return strings.Contains(msg, "exceeded your current quota")
+}
+
+// upstreamThrottleType classifies an upstream error message into OpenAI-style
+// error semantics; retryAfter is non-empty only for the transient rate limit.
+func upstreamThrottleType(msg string) (errType, retryAfter string) {
+	switch {
+	case upstreamQuotaExceeded(msg):
+		return "insufficient_quota", ""
+	case upstreamRateLimitRetryAfter(msg) != "":
+		return "rate_limit_error", upstreamRateLimitRetryAfter(msg)
+	}
+	return "api_error", ""
+}
 
 // fingerprintFile is the local (gitignored) device fingerprint reported to
 // /alpha/fingerprint/record at startup — the real CLI uploads it per process.
@@ -375,13 +411,22 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if ccResp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(ccResp.Body)
-		message := fmt.Sprintf("Upstream error: %s", redactSecrets(string(errBody)))
-		log.Printf("[错误] 上游返回 %d: %s", ccResp.StatusCode, redactSecrets(string(errBody)))
-		status := http.StatusBadGateway
-		if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
-			status = ccResp.StatusCode
+		raw := redactSecrets(string(errBody))
+		message := fmt.Sprintf("Upstream error: %s", raw)
+		log.Printf("[错误] 上游返回 %d: %s", ccResp.StatusCode, raw)
+		status, errType := http.StatusBadGateway, "api_error"
+		switch throttleType, retryAfter := upstreamThrottleType(raw); throttleType {
+		case "rate_limit_error":
+			status, errType = http.StatusTooManyRequests, throttleType
+			w.Header().Set("Retry-After", retryAfter)
+		case "insufficient_quota":
+			status, errType = http.StatusTooManyRequests, throttleType
+		default:
+			if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
+				status = ccResp.StatusCode
+			}
 		}
-		p.writeOpenAIError(w, status, message, "api_error")
+		p.writeOpenAIError(w, status, message, errType)
 		return
 	}
 
@@ -664,16 +709,24 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			finishSent = true
 
 		case "error":
-			log.Printf("[错误] 流式响应出错: %v", event.Error)
 			msg := "upstream stream error"
 			if event.Error != nil && event.Error.Message != "" {
 				msg = redactSecrets(event.Error.Message)
+			}
+			errType, retryAfter := upstreamThrottleType(msg)
+			switch errType {
+			case "rate_limit_error":
+				log.Printf("[警告] 上游限流 (%ss 后重试): %s", retryAfter, msg)
+			case "insufficient_quota":
+				log.Printf("[错误] 上游配额耗尽: %s", msg)
+			default:
+				log.Printf("[错误] 流式响应出错: %v", event.Error)
 			}
 			// Error frames inside the stream are how litellm-style gateways
 			// report mid-stream failures; OpenAI SDKs surface them as API
 			// errors. The finish/[DONE] tail below still closes the stream.
 			frame, _ := json.Marshal(map[string]any{
-				"error": map[string]any{"message": msg, "type": "api_error"},
+				"error": map[string]any{"message": msg, "type": errType},
 			})
 			fmt.Fprintf(w, "data: %s\n\n", frame)
 			flusher.Flush()
@@ -844,7 +897,15 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	// empty message and zero usage — clients would record it as a real
 	// completion. Propagate it as an error instead.
 	if upstreamErrMsg != "" {
-		p.writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+upstreamErrMsg, "api_error")
+		status := http.StatusBadGateway
+		errType, retryAfter := upstreamThrottleType(upstreamErrMsg)
+		if errType != "api_error" {
+			status = http.StatusTooManyRequests
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+		}
+		p.writeOpenAIError(w, status, "Upstream error: "+upstreamErrMsg, errType)
 		return
 	}
 
